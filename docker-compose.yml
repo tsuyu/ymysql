@@ -1,0 +1,32 @@
+# Test targets: one of each supported major line. Both expose the same monitor
+# user, so the app can be pointed at either port to check version handling.
+services:
+  mysql57:
+    image: mysql:5.7
+    command:
+      - --performance-schema=ON
+      - --performance-schema-consumer-events-statements-history-long=ON
+      - --slow-query-log=ON
+      - --long-query-time=0.5
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: demo
+    ports:
+      - "3357:3306"
+    volumes:
+      - ./scripts/monitor-user.sql:/docker-entrypoint-initdb.d/10-monitor-user.sql:ro
+
+  mysql80:
+    image: mysql:8.0
+    command:
+      - --performance-schema=ON
+      - --performance-schema-consumer-events-statements-history-long=ON
+      - --slow-query-log=ON
+      - --long-query-time=0.5
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: demo
+    ports:
+      - "3380:3306"
+    volumes:
+      - ./scripts/monitor-user.sql:/docker-entrypoint-initdb.d/10-monitor-user.sql:ro

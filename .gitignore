@@ -1,0 +1,27 @@
+# Build
+/target
+
+# Dumps written by the Dump tab land next to the binary or wherever the
+# user points the picker. They hold real schema and real rows -- never
+# commit them. Files under scripts/ are hand-written setup SQL, so the
+# rule is anchored to the root only.
+/*.sql
+/dumps/
+
+# Local runtime state, if ever pointed at the repo instead of the OS data dir
+metrics.db
+metrics.db-wal
+metrics.db-shm
+profiles.json
+
+# Secrets
+.env
+.env.*
+*.cnf
+!docker/*.cnf
+
+# OS / editor noise
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
