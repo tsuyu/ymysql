@@ -94,7 +94,7 @@ pub struct DumpProgress {
     pub rows: u64,
 }
 
-fn quote_ident(name: &str) -> Result<String> {
+pub fn quote_ident(name: &str) -> Result<String> {
     if name.is_empty() || name.len() > 64 || name.contains('\0') || name.contains('\n') {
         bail!("bad identifier: {name:?}");
     }
@@ -104,7 +104,7 @@ fn quote_ident(name: &str) -> Result<String> {
 /// mysqldump-style escaping. Backslash is an escape character in MySQL string
 /// literals, and NUL / ^Z break restores on some clients, so all of them go out
 /// as escape sequences.
-fn escape_string(s: &str) -> String {
+pub fn escape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {

@@ -18,6 +18,7 @@ use crate::db::schedule::ViewNeeds;
 use crate::db::sql::{BrowseSpec, Change, SqlOutcome, TableInfo, TableSchema};
 use crate::db::version::{Capabilities, ServerVersion};
 use crate::innodb::{EngineStatus, InnodbConfig};
+use crate::insert_sql;
 use crate::model::{Derived, History, Metric, Sample};
 use crate::profiles::{Profile, Profiles, SavedQuery};
 use crate::store::{self, StoreCmd, StoreEvent};
@@ -289,6 +290,16 @@ pub struct App {
     pub console_error: Option<String>,
     pub console_sort: Option<(usize, bool)>,
     pub console_history: Vec<String>,
+    /// Target file for the CSV export of the current result.
+    pub csv_path_text: String,
+    /// Prefix a UTF-8 BOM, which is what Excel needs for non-ASCII.
+    pub csv_bom: bool,
+    /// Target file for the `INSERT` export of the current result.
+    pub insert_path_text: String,
+    /// Target table and statement shape for the `INSERT` export.
+    pub insert_opts: insert_sql::Options,
+    /// Outcome of the last export: `(ok, message)`.
+    pub export_status: Option<(bool, String)>,
 
     // Table browser
     pub allow_writes: bool,
@@ -409,6 +420,11 @@ impl App {
             console_error: None,
             console_sort: None,
             console_history: Vec::new(),
+            csv_path_text: String::new(),
+            csv_bom: true,
+            insert_path_text: String::new(),
+            insert_opts: insert_sql::Options::default(),
+            export_status: None,
             allow_writes: false,
             schemas: Vec::new(),
             tables: Vec::new(),
@@ -973,6 +989,10 @@ impl App {
                     self.console_error = None;
                     self.console_sort = None;
                     self.console_result = Some(*out);
+                    // A new result makes the last export message stale, and
+                    // the suggested target table belongs to the old grid.
+                    self.export_status = None;
+                    self.insert_opts.table.clear();
                 }
                 Event::SqlError(e) => {
                     self.dump_running = false;

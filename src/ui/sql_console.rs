@@ -4,8 +4,11 @@ use egui::RichText;
 
 use super::*;
 use crate::app::App;
+use crate::csv;
 use crate::db::collector::Command;
 use crate::db::sql::{self, StatementKind};
+use crate::fmt_sql;
+use crate::insert_sql;
 
 impl App {
     pub fn sql_console_tab(&mut self, ui: &mut egui::Ui) {
@@ -22,6 +25,20 @@ impl App {
             }
             if self.busy {
                 ui.spinner();
+            }
+
+            if ui
+                .add_enabled(
+                    !self.console_sql.trim().is_empty(),
+                    egui::Button::new("Format  (Ctrl+Shift+F)"),
+                )
+                .on_hover_text(
+                    "Re-indents the editor text. Only whitespace and the case of reserved 
+                     words change -- literals, quoted identifiers and comments are left alone.",
+                )
+                .clicked()
+            {
+                self.console_sql = fmt_sql::format(&self.console_sql);
             }
 
             ui.separator();
@@ -60,10 +77,18 @@ impl App {
             );
         });
 
-        // Ctrl+Enter runs, matching every other SQL client.
-        let run_shortcut = ui.input(|i| {
-            i.key_pressed(egui::Key::Enter) && (i.modifiers.ctrl || i.modifiers.command)
+        // Ctrl+Enter runs and Ctrl+Shift+F formats, matching every other SQL
+        // client. Both are read before the editor so a keypress is not eaten.
+        let (run_shortcut, format_shortcut) = ui.input(|i| {
+            let cmd = i.modifiers.ctrl || i.modifiers.command;
+            (
+                i.key_pressed(egui::Key::Enter) && cmd,
+                i.key_pressed(egui::Key::F) && cmd && i.modifiers.shift,
+            )
         });
+        if format_shortcut && !self.console_sql.trim().is_empty() {
+            self.console_sql = fmt_sql::format(&self.console_sql);
+        }
 
         ui.add(
             egui::TextEdit::multiline(&mut self.console_sql)
@@ -154,6 +179,137 @@ impl App {
         // Console results are already in memory, so sorting is local.
         let order = sorted_order(&out.grid, self.console_sort);
         let view = reordered(&out.grid, &order);
+
+        // Export what is on screen, sorted order included. Borrow the export
+        // fields on their own so the `console_result` borrow above stays valid.
+        let csv_path = &mut self.csv_path_text;
+        let bom = &mut self.csv_bom;
+        let insert_path = &mut self.insert_path_text;
+        let insert_opts = &mut self.insert_opts;
+        let status = &mut self.export_status;
+        if csv_path.is_empty() {
+            *csv_path = csv::suggested_path().display().to_string();
+        }
+        if insert_path.is_empty() {
+            *insert_path = insert_sql::suggested_path().display().to_string();
+        }
+        if insert_opts.table.is_empty() {
+            insert_opts.table = insert_sql::suggested_table(&view);
+        }
+
+        egui::CollapsingHeader::new("Export")
+            .id_salt("console_export")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("CSV");
+                    if ui
+                        .button("Copy")
+                        .on_hover_text("Puts the whole result on the clipboard, header row first.")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(csv::render(&view));
+                        *status = Some((true, format!("{} rows copied as CSV", view.rows.len())));
+                    }
+                    let path = std::path::PathBuf::from(csv_path.trim());
+                    let usable =
+                        !csv_path.trim().is_empty() && crate::db::dump::path_is_usable(&path);
+                    if ui.add_enabled(usable, egui::Button::new("Save")).clicked() {
+                        *status = Some(match csv::write_file(&path, &view, *bom) {
+                            Ok(()) => (
+                                true,
+                                format!("{} rows written to {}", view.rows.len(), path.display()),
+                            ),
+                            Err(e) => (false, format!("{e:#}")),
+                        });
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(csv_path)
+                            .desired_width(300.0)
+                            .hint_text("path to the .csv file to write"),
+                    );
+                    ui.checkbox(bom, "Excel BOM").on_hover_text(
+                        "Prefixes a UTF-8 byte-order mark so Excel reads accented and \
+                         non-Latin text correctly. Turn it off for anything that parses \
+                         the file itself.",
+                    );
+                    if !csv_path.trim().is_empty() && !usable {
+                        ui.colored_label(RED, "no such directory");
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("SQL");
+                    let named = !insert_opts.table.trim().is_empty();
+                    if ui
+                        .add_enabled(named, egui::Button::new("Copy"))
+                        .on_hover_text("Puts the rows on the clipboard as INSERT statements.")
+                        .clicked()
+                    {
+                        *status = Some(match insert_sql::render(&view, insert_opts) {
+                            Ok(sql) => {
+                                ui.ctx().copy_text(sql);
+                                (true, format!("{} rows copied as SQL", view.rows.len()))
+                            }
+                            Err(e) => (false, format!("{e:#}")),
+                        });
+                    }
+                    let path = std::path::PathBuf::from(insert_path.trim());
+                    let usable = named
+                        && !insert_path.trim().is_empty()
+                        && crate::db::dump::path_is_usable(&path);
+                    if ui.add_enabled(usable, egui::Button::new("Save")).clicked() {
+                        *status = Some(match insert_sql::write_file(&path, &view, insert_opts) {
+                            Ok(()) => (
+                                true,
+                                format!("{} rows written to {}", view.rows.len(), path.display()),
+                            ),
+                            Err(e) => (false, format!("{e:#}")),
+                        });
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(insert_path)
+                            .desired_width(300.0)
+                            .hint_text("path to the .sql file to write"),
+                    );
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("     into");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut insert_opts.table)
+                            .desired_width(220.0)
+                            .hint_text("table or schema.table"),
+                    )
+                    .on_hover_text(
+                        "Pre-filled when every column traces back to one table. A join \
+                         leaves it blank -- name the target yourself.",
+                    );
+                    egui::ComboBox::from_id_salt("insert_verb")
+                        .selected_text(insert_opts.verb.label())
+                        .show_ui(ui, |ui| {
+                            for v in insert_sql::Verb::ALL {
+                                ui.selectable_value(&mut insert_opts.verb, v, v.label());
+                            }
+                        });
+                    ui.add(
+                        egui::DragValue::new(&mut insert_opts.rows_per_statement)
+                            .range(1..=1000)
+                            .prefix("rows/statement "),
+                    );
+                    ui.label(
+                        RichText::new("values are quoted strings; MySQL casts them on insert")
+                            .small()
+                            .weak(),
+                    );
+                });
+            });
+
+        if let Some((ok, msg)) = status {
+            ui.colored_label(if *ok { GREEN } else { RED }, msg.as_str());
+        }
+        ui.add_space(4.0);
+
         let resp = data_grid(ui, "console_result", &view, self.console_sort, jumpable);
 
         if let Some(col) = resp.header_clicked {

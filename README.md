@@ -24,7 +24,7 @@ Twelve tabs, in the order they appear:
 | **Index Advisor** | Missing composite indexes proposed from the real workload with estimated impact and ready DDL, plus duplicate/redundant indexes, unused indexes, full table scans, tables without a primary key and function-wrapped predicates |
 | **Historical Metrics** | Any metric over 15m–7d from the on-disk store, with rollups, store stats and CSV export |
 | **Alerts** | Threshold rules with a hold window, live rule state, a firing banner and a transition log |
-| **SQL** | Ad-hoc console: pick a default database, run with Ctrl+Enter, sort by clicking a header, click any value to open that row in the Table Browser, save named queries against the active profile |
+| **SQL** | Ad-hoc console: pick a default database, run with Ctrl+Enter, re-indent with Ctrl+Shift+F, sort by clicking a header, copy or save the result as CSV or as `INSERT` statements, click any value to open that row in the Table Browser, save named queries against the active profile |
 | **Tables** | Schema/table picker, paged rows with server-side sort, WHERE filter, column metadata, and click-a-cell editing with queued changes |
 | **Dump** | Export a database to `.sql` — structure only, data only or both; table picker, optional `DROP TABLE IF EXISTS`, consistent snapshot, live progress, cancel |
 | **Connections** | Threads connected/running against `max_connections` with usage bands, breakdown by user and host, long-running and stale-idle session lists with per-row kill |
@@ -45,6 +45,9 @@ Twelve tabs, in the order they appear:
 | [src/db/sql.rs](src/db/sql.rs) | Console, browser and row edits — everything that can write |
 | [src/db/dump.rs](src/db/dump.rs) | `mysqldump`-shaped export writer |
 | [src/advisor.rs](src/advisor.rs) | Index and workload findings |
+| [src/fmt_sql.rs](src/fmt_sql.rs) | SQL lexer + pretty-printer for the console |
+| [src/csv.rs](src/csv.rs) | RFC 4180 CSV export of a result grid |
+| [src/insert_sql.rs](src/insert_sql.rs) | `INSERT` statement export of a result grid |
 | [src/suggest.rs](src/suggest.rs) | Digest parser + composite index proposals |
 | [src/innodb.rs](src/innodb.rs) | `SHOW ENGINE INNODB STATUS` parser + health bands |
 | [src/connections.rs](src/connections.rs) | Connection-pool grouping and classification |
@@ -222,6 +225,76 @@ Columns that are expressions, literals or aggregates have no origin and stay
 inert; clicking a header still sorts. The filter literal is escaped for both
 quotes and backslashes.
 
+## Formatting SQL
+
+**Format** in the SQL tab, or Ctrl+Shift+F, re-indents the editor contents.
+[src/fmt_sql.rs](src/fmt_sql.rs) lexes the text rather than pattern-matching it,
+so the transformation is limited to two things: whitespace, and the case of
+reserved words. String literals, backtick-quoted identifiers, numbers,
+placeholders and comments come back byte-for-byte.
+
+Clause heads (`SELECT`, `FROM`, `WHERE`, `GROUP BY`, …) start a line, joins and
+`AND`/`OR` indent one level under them, a `SELECT` or `SET` list with more than
+one item goes one item per line, and a parenthesis that opens a subquery becomes
+its own block while a function call stays inline.
+
+Case handling is deliberately conservative. Only *reserved* words are
+upper-cased, plus a word sitting directly in front of `(`, which can only be a
+routine call. Neither can be a bare table name — and that is the point, because
+table names are case-sensitive on Linux while column and routine names never
+are. A table that happens to be called `offset` or `count` keeps its case and
+its meaning.
+
+Two unit tests hold the contract: one re-lexes the output and asserts the token
+stream is identical to the input except for word case, and one asserts
+formatting twice gives the same result as formatting once.
+
+## Exporting a result
+
+The **Export** section under a result offers two formats, CSV and `INSERT`
+statements. Each has **Copy** (to the clipboard) and **Save** (to the path in
+the box, pre-filled with a timestamped name in the working directory). Both
+export the grid *as displayed*, so a column sort is reflected in the output.
+
+### CSV
+
+[src/csv.rs](src/csv.rs) follows RFC 4180: CRLF line endings, and a field is
+quoted when it holds a comma, a quote, a newline or edge whitespace, with an
+embedded quote doubled.
+
+SQL `NULL` and the empty string are different values and CSV cannot say so on
+its own, so this uses the `COPY ... CSV` convention: `NULL` is written as
+nothing at all, an empty string as `""`.
+
+**Excel BOM** is on by default and prefixes a UTF-8 byte-order mark, which is
+what makes Excel read accented and non-Latin text correctly. Turn it off for
+anything that parses the file itself.
+
+Cell values are exported verbatim, including any that begin with `=`, `+`, `-`
+or `@`. Spreadsheets treat those as formulas — a known CSV injection route. The
+export stays faithful to the data rather than mangling it, so treat a CSV built
+from untrusted rows the way you would treat any untrusted file.
+
+### INSERT statements
+
+[src/insert_sql.rs](src/insert_sql.rs) writes the rows as `INSERT`, `INSERT
+IGNORE` or `REPLACE`, batched at the chosen rows per statement (1 gives one
+statement per row). Table and column identifiers are backtick-quoted, and string
+values are escaped the way a restore expects — backslash, quote, newline, NUL
+and `^Z` all go out as escape sequences.
+
+The target table is pre-filled from the column origins when every column traces
+back to one table; a join leaves it blank for you to name. Columns are written
+under their *origin* names, so `SELECT id AS user_id` still inserts into `id`.
+An expression column has no origin and keeps its header.
+
+Every non-`NULL` value is emitted as a quoted string and MySQL casts it on
+insert. Emitting numbers bare would turn `007` into `7` in a `VARCHAR` column,
+and a grid carries no column types to decide otherwise. For the same reason this
+is a convenience export, not a faithful copy — binary columns have already been
+stringified by the time they reach the grid. Use the Dump tab for that; it works
+from the raw protocol values.
+
 ## Editing data
 
 The SQL tab and the Table Browser can change the connected server, so both sit
@@ -310,7 +383,7 @@ UPDATE performance_schema.setup_instruments
 ## Development
 
 ```sh
-cargo test                    # 85 unit tests, no server required
+cargo test                    # 129 unit tests, no server required
 cargo clippy --all-targets
 cargo fmt
 cargo build --release
