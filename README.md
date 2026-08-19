@@ -24,7 +24,7 @@ Twelve tabs, in the order they appear:
 | **Index Advisor** | Missing composite indexes proposed from the real workload with estimated impact and ready DDL, plus duplicate/redundant indexes, unused indexes, full table scans, tables without a primary key and function-wrapped predicates |
 | **Historical Metrics** | Any metric over 15m–7d from the on-disk store, with rollups, store stats and CSV export |
 | **Alerts** | Threshold rules with a hold window, live rule state, a firing banner and a transition log |
-| **SQL** | Ad-hoc console: pick a default database, run with Ctrl+Enter, re-indent with Ctrl+Shift+F, sort by clicking a header, copy or save the result as CSV or as `INSERT` statements, click any value to open that row in the Table Browser, save named queries against the active profile |
+| **SQL** | Ad-hoc console: pick a default database, run with Ctrl+Enter, re-indent with Ctrl+Shift+F, sort by clicking a header, copy or save the result as CSV, JSON, Markdown, HTML or `INSERT` statements, click any value to open that row in the Table Browser, save named queries against the active profile |
 | **Tables** | Schema/table picker, paged rows with server-side sort, WHERE filter, column metadata, and click-a-cell editing with queued changes |
 | **Dump** | Export a database to `.sql` — structure only, data only or both; table picker, optional `DROP TABLE IF EXISTS`, consistent snapshot, live progress, cancel |
 | **Connections** | Threads connected/running against `max_connections` with usage bands, breakdown by user and host, long-running and stale-idle session lists with per-row kill |
@@ -47,7 +47,10 @@ Twelve tabs, in the order they appear:
 | [src/advisor.rs](src/advisor.rs) | Index and workload findings |
 | [src/fmt_sql.rs](src/fmt_sql.rs) | SQL lexer + pretty-printer for the console |
 | [src/csv.rs](src/csv.rs) | RFC 4180 CSV export of a result grid |
+| [src/json_rows.rs](src/json_rows.rs) | JSON and NDJSON export of a result grid |
+| [src/markdown_table.rs](src/markdown_table.rs) | Markdown table export of a result grid |
 | [src/insert_sql.rs](src/insert_sql.rs) | `INSERT` statement export of a result grid |
+| [src/html_table.rs](src/html_table.rs) | HTML table export of a result grid |
 | [src/suggest.rs](src/suggest.rs) | Digest parser + composite index proposals |
 | [src/innodb.rs](src/innodb.rs) | `SHOW ENGINE INNODB STATUS` parser + health bands |
 | [src/connections.rs](src/connections.rs) | Connection-pool grouping and classification |
@@ -251,10 +254,16 @@ formatting twice gives the same result as formatting once.
 
 ## Exporting a result
 
-The **Export** section under a result offers two formats, CSV and `INSERT`
-statements. Each has **Copy** (to the clipboard) and **Save** (to the path in
-the box, pre-filled with a timestamped name in the working directory). Both
-export the grid *as displayed*, so a column sort is reflected in the output.
+The **Export** section under a result offers five formats: CSV, JSON, Markdown,
+HTML and `INSERT` statements. Each has **Copy** (to the clipboard) and **Save**
+(to the path in the box, pre-filled with a timestamped name in the working
+directory). All of them export the grid *as displayed*, so a column sort is
+reflected in the output.
+
+Only JSON can express a SQL `NULL` directly. The other four need a convention,
+and each one keeps `NULL` distinct from the empty string rather than flattening
+the two together — that difference is usually the reason someone is looking at
+the row in the first place.
 
 ### CSV
 
@@ -274,6 +283,55 @@ Cell values are exported verbatim, including any that begin with `=`, `+`, `-`
 or `@`. Spreadsheets treat those as formulas — a known CSV injection route. The
 export stays faithful to the data rather than mangling it, so treat a CSV built
 from untrusted rows the way you would treat any untrusted file.
+
+### JSON
+
+[src/json_rows.rs](src/json_rows.rs) writes one object per row, keyed by column
+name. `NULL` becomes JSON `null` — this is the one format that can say so
+without a convention.
+
+**NDJSON** switches to one compact object per line with no wrapping array, which
+streams into log pipelines and survives being cut in half; the suggested
+filename follows with a `.ndjson` extension. **pretty** indents the array form.
+
+Values are strings, not numbers. A grid carries no column types and guessing
+costs more than it saves: a `BIGINT` id above 2^53 loses precision the moment a
+JavaScript consumer parses it as a number, and `007` from a `VARCHAR` would come
+back as `7`. Strings round-trip both.
+
+Two columns with the same name — `id` from either side of a join — would be one
+repeated JSON key, and most parsers keep only the last. The second is suffixed
+`id_2` instead, skipping any suffix that would collide with a real column.
+
+### Markdown
+
+[src/markdown_table.rs](src/markdown_table.rs) writes a GitHub-flavoured pipe
+table for pasting into an issue, a pull request or a ticket. Cells are padded to
+a common width so the raw text lines up before anything renders it, and a column
+whose values all parse as numbers is right-aligned — presentation only, never a
+change to a value.
+
+A `|` would end the cell and a newline would end the row, so both are rewritten:
+backslashes and pipes are escaped, and a line break becomes `<br>` rather than
+being dropped. `NULL` renders as `_NULL_`, which an empty cell cannot be
+mistaken for.
+
+### HTML
+
+[src/html_table.rs](src/html_table.rs) writes a `<table>` with a caption naming
+the source table and the row count. **Standalone page** is on by default and
+wraps it in a document with a charset, a title and an inline stylesheet, so the
+file opens correctly on its own and follows the reader's light or dark theme.
+Turn it off for a bare `<table>` to paste into a page of your own.
+
+Result rows are server data, so every cell and column name is escaped —
+`&`, `<`, `>`, `"` and `'` all go out as entities, which is safe in both text
+and attribute positions. A value of `<script>alert(1)</script>` renders as that
+text and nothing else. Tests cover the values, the headers and the document
+title.
+
+`NULL` gets its own dimmed cell so it cannot be confused with the literal text
+`NULL` or with the empty string.
 
 ### INSERT statements
 
@@ -383,7 +441,7 @@ UPDATE performance_schema.setup_instruments
 ## Development
 
 ```sh
-cargo test                    # 129 unit tests, no server required
+cargo test                    # 166 unit tests, no server required
 cargo clippy --all-targets
 cargo fmt
 cargo build --release

@@ -8,7 +8,10 @@ use crate::csv;
 use crate::db::collector::Command;
 use crate::db::sql::{self, StatementKind};
 use crate::fmt_sql;
+use crate::html_table;
 use crate::insert_sql;
+use crate::json_rows;
+use crate::markdown_table;
 
 impl App {
     pub fn sql_console_tab(&mut self, ui: &mut egui::Ui) {
@@ -184,11 +187,27 @@ impl App {
         // fields on their own so the `console_result` borrow above stays valid.
         let csv_path = &mut self.csv_path_text;
         let bom = &mut self.csv_bom;
+        let json_path = &mut self.json_path_text;
+        let json_opts = &mut self.json_opts;
+        let markdown_path = &mut self.markdown_path_text;
+        let html_path = &mut self.html_path_text;
+        let html_opts = &mut self.html_opts;
         let insert_path = &mut self.insert_path_text;
         let insert_opts = &mut self.insert_opts;
         let status = &mut self.export_status;
         if csv_path.is_empty() {
             *csv_path = csv::suggested_path().display().to_string();
+        }
+        if json_path.is_empty() {
+            *json_path = json_rows::suggested_path(json_opts.ndjson)
+                .display()
+                .to_string();
+        }
+        if markdown_path.is_empty() {
+            *markdown_path = markdown_table::suggested_path().display().to_string();
+        }
+        if html_path.is_empty() {
+            *html_path = html_table::suggested_path().display().to_string();
         }
         if insert_path.is_empty() {
             *insert_path = insert_sql::suggested_path().display().to_string();
@@ -196,6 +215,14 @@ impl App {
         if insert_opts.table.is_empty() {
             insert_opts.table = insert_sql::suggested_table(&view);
         }
+        // Label the exported page with the source table when there is one, and
+        // follow the field if the user renames the target.
+        let table = insert_opts.table.trim();
+        html_opts.title = if table.is_empty() {
+            "Query result".to_string()
+        } else {
+            table.to_string()
+        };
 
         egui::CollapsingHeader::new("Export")
             .id_salt("console_export")
@@ -272,6 +299,117 @@ impl App {
                             .desired_width(300.0)
                             .hint_text("path to the .sql file to write"),
                     );
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("JSON");
+                    if ui
+                        .button("Copy")
+                        .on_hover_text("Puts the rows on the clipboard as JSON objects.")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(json_rows::render(&view, json_opts));
+                        *status = Some((true, format!("{} rows copied as JSON", view.rows.len())));
+                    }
+                    let path = std::path::PathBuf::from(json_path.trim());
+                    let usable =
+                        !json_path.trim().is_empty() && crate::db::dump::path_is_usable(&path);
+                    if ui.add_enabled(usable, egui::Button::new("Save")).clicked() {
+                        *status = Some(match json_rows::write_file(&path, &view, json_opts) {
+                            Ok(()) => (
+                                true,
+                                format!("{} rows written to {}", view.rows.len(), path.display()),
+                            ),
+                            Err(e) => (false, format!("{e:#}")),
+                        });
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(json_path)
+                            .desired_width(300.0)
+                            .hint_text("path to the .json file to write"),
+                    );
+                    ui.add_enabled(
+                        !json_opts.ndjson,
+                        egui::Checkbox::new(&mut json_opts.pretty, "pretty"),
+                    )
+                    .on_hover_text("Indented, one field per line.");
+                    if ui
+                        .checkbox(&mut json_opts.ndjson, "NDJSON")
+                        .on_hover_text(
+                            "One compact object per line with no wrapping array, for \
+                             streaming into log pipelines.",
+                        )
+                        .changed()
+                    {
+                        // The extension has to follow the shape being written.
+                        *json_path = json_rows::suggested_path(json_opts.ndjson)
+                            .display()
+                            .to_string();
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Markdown");
+                    if ui
+                        .button("Copy")
+                        .on_hover_text("Puts the result on the clipboard as a Markdown table.")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(markdown_table::render(&view));
+                        *status =
+                            Some((true, format!("{} rows copied as Markdown", view.rows.len())));
+                    }
+                    let path = std::path::PathBuf::from(markdown_path.trim());
+                    let usable =
+                        !markdown_path.trim().is_empty() && crate::db::dump::path_is_usable(&path);
+                    if ui.add_enabled(usable, egui::Button::new("Save")).clicked() {
+                        *status = Some(match markdown_table::write_file(&path, &view) {
+                            Ok(()) => (
+                                true,
+                                format!("{} rows written to {}", view.rows.len(), path.display()),
+                            ),
+                            Err(e) => (false, format!("{e:#}")),
+                        });
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(markdown_path)
+                            .desired_width(300.0)
+                            .hint_text("path to the .md file to write"),
+                    );
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("HTML");
+                    if ui
+                        .button("Copy")
+                        .on_hover_text("Puts the result on the clipboard as an HTML table.")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(html_table::render(&view, html_opts));
+                        *status = Some((true, format!("{} rows copied as HTML", view.rows.len())));
+                    }
+                    let path = std::path::PathBuf::from(html_path.trim());
+                    let usable =
+                        !html_path.trim().is_empty() && crate::db::dump::path_is_usable(&path);
+                    if ui.add_enabled(usable, egui::Button::new("Save")).clicked() {
+                        *status = Some(match html_table::write_file(&path, &view, html_opts) {
+                            Ok(()) => (
+                                true,
+                                format!("{} rows written to {}", view.rows.len(), path.display()),
+                            ),
+                            Err(e) => (false, format!("{e:#}")),
+                        });
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(html_path)
+                            .desired_width(300.0)
+                            .hint_text("path to the .html file to write"),
+                    );
+                    ui.checkbox(&mut html_opts.full_document, "standalone page")
+                        .on_hover_text(
+                            "On: a complete page with a stylesheet. Off: a bare <table> \
+                             to paste into a page of your own.",
+                        );
                 });
 
                 ui.horizontal_wrapped(|ui| {

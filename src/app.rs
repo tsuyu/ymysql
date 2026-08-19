@@ -17,8 +17,10 @@ use crate::db::queries::{
 use crate::db::schedule::ViewNeeds;
 use crate::db::sql::{BrowseSpec, Change, SqlOutcome, TableInfo, TableSchema};
 use crate::db::version::{Capabilities, ServerVersion};
+use crate::html_table;
 use crate::innodb::{EngineStatus, InnodbConfig};
 use crate::insert_sql;
+use crate::json_rows;
 use crate::model::{Derived, History, Metric, Sample};
 use crate::profiles::{Profile, Profiles, SavedQuery};
 use crate::store::{self, StoreCmd, StoreEvent};
@@ -294,6 +296,16 @@ pub struct App {
     pub csv_path_text: String,
     /// Prefix a UTF-8 BOM, which is what Excel needs for non-ASCII.
     pub csv_bom: bool,
+    /// Target file for the JSON export of the current result.
+    pub json_path_text: String,
+    /// Pretty versus compact, and array versus newline-delimited.
+    pub json_opts: json_rows::Options,
+    /// Target file for the Markdown export of the current result.
+    pub markdown_path_text: String,
+    /// Target file for the HTML export of the current result.
+    pub html_path_text: String,
+    /// Standalone document versus a bare `<table>` fragment.
+    pub html_opts: html_table::Options,
     /// Target file for the `INSERT` export of the current result.
     pub insert_path_text: String,
     /// Target table and statement shape for the `INSERT` export.
@@ -422,6 +434,11 @@ impl App {
             console_history: Vec::new(),
             csv_path_text: String::new(),
             csv_bom: true,
+            json_path_text: String::new(),
+            json_opts: json_rows::Options::default(),
+            markdown_path_text: String::new(),
+            html_path_text: String::new(),
+            html_opts: html_table::Options::default(),
             insert_path_text: String::new(),
             insert_opts: insert_sql::Options::default(),
             export_status: None,
