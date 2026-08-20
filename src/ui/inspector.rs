@@ -5,6 +5,7 @@ use egui::RichText;
 use super::*;
 use crate::app::{App, Tab};
 use crate::db::collector::Command;
+use crate::fmt_sql;
 
 impl App {
     pub fn inspector_tab(&mut self, ui: &mut egui::Ui) {
@@ -96,18 +97,47 @@ impl App {
         ui.separator();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.label(RichText::new("Statement").strong());
-            let mut text = row.text.clone();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Statement").strong());
+                ui.checkbox(&mut self.inspector_formatted, "Format")
+                    .on_hover_text(
+                        "performance_schema stores the digest as one long line.                          This re-indents it; only whitespace and the case of                          reserved words change.",
+                    );
+            });
+
+            // What is on screen is what Copy and Send to SQL hand on.
+            let shown = if self.inspector_formatted {
+                if self.inspector_fmt_cache.0 != row.text {
+                    self.inspector_fmt_cache = (row.text.clone(), fmt_sql::format(&row.text));
+                }
+                self.inspector_fmt_cache.1.clone()
+            } else {
+                row.text.clone()
+            };
+            let mut text = shown.clone();
             ui.add(
                 egui::TextEdit::multiline(&mut text)
                     .code_editor()
                     .desired_width(f32::INFINITY)
-                    .desired_rows(4)
+                    .desired_rows(if self.inspector_formatted { 10 } else { 4 })
                     .interactive(false),
             );
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Copy").clicked() {
-                    ui.ctx().copy_text(row.text.clone());
+                    ui.ctx().copy_text(shown.clone());
+                }
+                if ui
+                    .button("Send to SQL tab")
+                    .on_hover_text(
+                        "Loads the statement into the console, with this digest's                          schema selected, ready to edit and run.",
+                    )
+                    .clicked()
+                {
+                    self.console_sql = shown.clone();
+                    if !row.schema.is_empty() {
+                        self.console_schema = Some(row.schema.clone());
+                    }
+                    self.tab = Tab::Sql;
                 }
 
                 let explainable = row.text.trim_start().len() >= 6
@@ -191,7 +221,12 @@ impl App {
                             } else {
                                 RichText::new("0")
                             });
-                            ui.label(one_line(&s.sql, 90)).on_hover_text(&s.sql);
+                            // Formatting every sample every frame would be waste;
+                            // the hovered one is the only one anybody reads.
+                            let cell = ui.label(one_line(&s.sql, 90));
+                            if cell.hovered() {
+                                cell.on_hover_text(fmt_sql::format(&s.sql));
+                            }
                             ui.end_row();
                         }
                     });

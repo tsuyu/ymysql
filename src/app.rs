@@ -282,6 +282,13 @@ pub struct App {
     pub new_rule_threshold: f64,
     pub new_rule_for: f64,
 
+    /// Show the inspected statement re-indented rather than as the single
+    /// line performance_schema stores.
+    pub inspector_formatted: bool,
+    /// `(source, formatted)` for the inspected statement, so the formatter
+    /// runs when the digest changes rather than once per frame.
+    pub inspector_fmt_cache: (String, String),
+
     // SQL console
     pub console_sql: String,
     /// Default database for console statements; `None` runs with no `USE`.
@@ -425,6 +432,8 @@ impl App {
             new_rule_cmp: alerts::Comparison::Above,
             new_rule_threshold: 1000.0,
             new_rule_for: 30.0,
+            inspector_formatted: true,
+            inspector_fmt_cache: (String::new(), String::new()),
             console_sql: "SELECT 1;".to_string(),
             console_schema: None,
             query_name: String::new(),

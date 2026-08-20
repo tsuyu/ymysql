@@ -19,7 +19,7 @@ Twelve tabs, in the order they appear:
 | --- | --- |
 | **Dashboard** | Live stat cards (QPS, TPS, threads, slow queries, buffer pool hit, network, lock waits, firing alerts), rolling 15-minute plots, the five worst statements, and the raw `SHOW GLOBAL STATUS` table with per-second deltas |
 | **Top SQL** | Statement digests sorted by total/avg/max time, executions, rows examined or examined-per-sent; flags temp-disk tables and no-index executions; click a row to inspect |
-| **Query Inspector** | One digest in full: counters, statement text, `EXPLAIN` (SELECT only), and recent executions from `events_statements_history_long` |
+| **Query Inspector** | One digest in full: counters, statement text re-indented by the SQL formatter, `EXPLAIN` (SELECT only), a hand-off to the SQL tab, and recent executions from `events_statements_history_long` |
 | **Lock Monitor** | Blocking/waiting pairs as cards — PID, user, database, lock duration, locked table, index, lock mode, both statements, kill either side — plus open InnoDB transactions, metadata locks and the full session list |
 | **Index Advisor** | Missing composite indexes proposed from the real workload with estimated impact and ready DDL, plus duplicate/redundant indexes, unused indexes, full table scans, tables without a primary key and function-wrapped predicates |
 | **Historical Metrics** | Any metric over 15m–7d from the on-disk store, with rollups, store stats and CSV export |
@@ -251,6 +251,16 @@ its meaning.
 Two unit tests hold the contract: one re-lexes the output and asserts the token
 stream is identical to the input except for word case, and one asserts
 formatting twice gives the same result as formatting once.
+
+The Query Inspector uses the same formatter. `performance_schema` stores a
+digest as one long line, so **Format** is on by default there; the checkbox
+turns it off to see exactly what the server holds. **Copy** and **Send to SQL
+tab** both hand on whichever version is on screen, and the latter also selects
+the digest's schema in the console, so a slow statement goes from Top SQL to an
+editable, runnable query in two clicks. Hovering a row under *Recent executions*
+shows that sample formatted; it is rendered only for the row under the pointer,
+and the inspected statement is formatted once per digest rather than once per
+frame.
 
 ## Exporting a result
 
