@@ -19,15 +19,18 @@ pub enum HeavyTask {
     MetadataLocks,
     /// `SHOW ENGINE INNODB STATUS` — cheap, but a whole report to parse.
     Innodb,
+    /// Replica status, source position and connected replicas.
+    Replication,
 }
 
 impl HeavyTask {
-    const ROTATION: [HeavyTask; 5] = [
+    const ROTATION: [HeavyTask; 6] = [
         HeavyTask::Digests,
         HeavyTask::LockWaits,
         HeavyTask::Transactions,
         HeavyTask::MetadataLocks,
         HeavyTask::Innodb,
+        HeavyTask::Replication,
     ];
 }
 
@@ -42,6 +45,8 @@ pub struct ViewNeeds {
     pub locks: bool,
     /// The InnoDB engine report.
     pub innodb: bool,
+    /// Replication status.
+    pub replication: bool,
 }
 
 impl Default for ViewNeeds {
@@ -52,6 +57,7 @@ impl Default for ViewNeeds {
             digests: true,
             locks: true,
             innodb: false,
+            replication: false,
         }
     }
 }
@@ -64,6 +70,7 @@ impl ViewNeeds {
             digests: false,
             locks: false,
             innodb: false,
+            replication: false,
         }
     }
 
@@ -72,11 +79,12 @@ impl ViewNeeds {
             HeavyTask::Digests => self.digests,
             HeavyTask::LockWaits | HeavyTask::Transactions | HeavyTask::MetadataLocks => self.locks,
             HeavyTask::Innodb => self.innodb,
+            HeavyTask::Replication => self.replication,
         }
     }
 
     fn any_heavy(&self) -> bool {
-        self.digests || self.locks || self.innodb
+        self.digests || self.locks || self.innodb || self.replication
     }
 }
 
@@ -232,6 +240,7 @@ mod tests {
             digests: true,
             locks: true,
             innodb: true,
+            replication: true,
         });
         let picked: Vec<HeavyTask> = heavy_ticks(&mut s, 30).into_iter().flatten().collect();
 
@@ -244,7 +253,8 @@ mod tests {
         assert_eq!(picked[2], HeavyTask::Transactions);
         assert_eq!(picked[3], HeavyTask::MetadataLocks);
         assert_eq!(picked[4], HeavyTask::Innodb);
-        assert_eq!(picked[5], HeavyTask::Digests, "rotation wraps");
+        assert_eq!(picked[5], HeavyTask::Replication);
+        assert_eq!(picked[6], HeavyTask::Digests, "rotation wraps");
     }
 
     #[test]
@@ -286,6 +296,7 @@ mod tests {
             digests: true,
             locks: false,
             innodb: false,
+            replication: false,
         });
         let picked: Vec<HeavyTask> = heavy_ticks(&mut s, 40).into_iter().flatten().collect();
         assert!(!picked.is_empty());
@@ -314,6 +325,7 @@ mod tests {
             digests: true,
             locks: false,
             innodb: false,
+            replication: false,
         });
         assert!(
             s.next_heavy().is_some(),

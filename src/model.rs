@@ -23,6 +23,12 @@ impl Sample {
     pub fn stat(&self, key: &str) -> u64 {
         self.status.get(key).copied().unwrap_or(0)
     }
+
+    /// Whether the server reported this counter at all, which is not the same
+    /// as it being zero.
+    pub fn has_stat(&self, key: &str) -> bool {
+        self.status.contains_key(key)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,9 +86,21 @@ impl Derived {
             1.0
         };
 
+        // `Com_commit` counts only *explicit* COMMIT statements, so on an
+        // autocommit workload -- which is most of them -- it stays at zero
+        // while the server is busy, and a TPS card reading 0.00 at 900 qps
+        // looks broken. `Handler_commit` counts the commit each statement
+        // performs, implicit ones included, which is the real transaction
+        // rate. Older forks without the handler counters fall back.
+        let tps = if cur.has_stat("Handler_commit") {
+            (d("Handler_commit") + d("Handler_rollback")) / dt
+        } else {
+            (d("Com_commit") + d("Com_rollback")) / dt
+        };
+
         Self {
             qps: rate("Queries"),
-            tps: (d("Com_commit") + d("Com_rollback")) / dt,
+            tps,
             slow_qps: rate("Slow_queries"),
             threads_connected: cur.stat("Threads_connected") as f64,
             threads_running: cur.stat("Threads_running") as f64,
@@ -243,5 +261,152 @@ impl History {
 
     pub fn clear(&mut self) {
         self.series.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(t: f64, stats: &[(&str, u64)]) -> Sample {
+        Sample {
+            t,
+            wall_ms: (t * 1000.0) as i64,
+            status: stats.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            status_raw: HashMap::new(),
+            processlist: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rates_are_per_second_over_the_real_interval() {
+        // The gap matters: a resumed collector must not turn a large delta
+        // into a spike by dividing by the nominal interval.
+        let a = sample(0.0, &[("Queries", 100)]);
+        let b = sample(10.0, &[("Queries", 200)]);
+        assert_eq!(Derived::between(&a, &b).qps, 10.0);
+    }
+
+    #[test]
+    fn a_counter_reset_yields_zero_rather_than_a_negative_rate() {
+        let a = sample(0.0, &[("Queries", 5_000)]);
+        let b = sample(1.0, &[("Queries", 7)]);
+        assert_eq!(Derived::between(&a, &b).qps, 0.0);
+    }
+
+    #[test]
+    fn a_zero_or_backwards_interval_is_ignored() {
+        let a = sample(5.0, &[("Queries", 100)]);
+        let b = sample(5.0, &[("Queries", 200)]);
+        assert_eq!(Derived::between(&a, &b).qps, 0.0);
+        let c = sample(4.0, &[("Queries", 200)]);
+        assert_eq!(Derived::between(&a, &c).qps, 0.0);
+    }
+
+    #[test]
+    fn tps_counts_autocommit_transactions() {
+        // An autocommit workload: Com_commit never moves, Handler_commit does.
+        let a = sample(
+            0.0,
+            &[
+                ("Com_commit", 3),
+                ("Com_rollback", 0),
+                ("Handler_commit", 1_000),
+            ],
+        );
+        let b = sample(
+            1.0,
+            &[
+                ("Com_commit", 3),
+                ("Com_rollback", 0),
+                ("Handler_commit", 1_050),
+            ],
+        );
+        assert_eq!(
+            Derived::between(&a, &b).tps,
+            50.0,
+            "implicit commits have to count, or a busy server reads as idle"
+        );
+    }
+
+    #[test]
+    fn tps_includes_rollbacks() {
+        let a = sample(0.0, &[("Handler_commit", 10), ("Handler_rollback", 1)]);
+        let b = sample(1.0, &[("Handler_commit", 14), ("Handler_rollback", 3)]);
+        assert_eq!(Derived::between(&a, &b).tps, 6.0);
+    }
+
+    #[test]
+    fn tps_falls_back_to_com_counters_when_the_handler_ones_are_absent() {
+        let a = sample(0.0, &[("Com_commit", 10), ("Com_rollback", 0)]);
+        let b = sample(1.0, &[("Com_commit", 17), ("Com_rollback", 1)]);
+        assert_eq!(Derived::between(&a, &b).tps, 8.0);
+    }
+
+    #[test]
+    fn a_present_zero_counter_is_not_treated_as_missing() {
+        // Handler_commit exists but has not moved: the answer is 0 tps, and
+        // the fallback must not kick in and report Com_commit instead.
+        let a = sample(0.0, &[("Handler_commit", 5), ("Com_commit", 100)]);
+        let b = sample(1.0, &[("Handler_commit", 5), ("Com_commit", 200)]);
+        assert_eq!(Derived::between(&a, &b).tps, 0.0);
+    }
+
+    #[test]
+    fn the_buffer_pool_hit_ratio_is_a_fraction_of_requests() {
+        let a = sample(
+            0.0,
+            &[
+                ("Innodb_buffer_pool_reads", 0),
+                ("Innodb_buffer_pool_read_requests", 0),
+            ],
+        );
+        let b = sample(
+            1.0,
+            &[
+                ("Innodb_buffer_pool_reads", 1),
+                ("Innodb_buffer_pool_read_requests", 100),
+            ],
+        );
+        assert!((Derived::between(&a, &b).bp_hit_ratio - 0.99).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_idle_buffer_pool_reads_as_a_perfect_hit_ratio() {
+        // No requests at all: reporting 0% would light up every alert.
+        let a = sample(0.0, &[("Innodb_buffer_pool_read_requests", 10)]);
+        let b = sample(1.0, &[("Innodb_buffer_pool_read_requests", 10)]);
+        assert_eq!(Derived::between(&a, &b).bp_hit_ratio, 1.0);
+    }
+
+    #[test]
+    fn rows_written_sums_the_three_write_counters() {
+        let a = sample(
+            0.0,
+            &[
+                ("Innodb_rows_inserted", 1),
+                ("Innodb_rows_updated", 1),
+                ("Innodb_rows_deleted", 1),
+            ],
+        );
+        let b = sample(
+            2.0,
+            &[
+                ("Innodb_rows_inserted", 3),
+                ("Innodb_rows_updated", 5),
+                ("Innodb_rows_deleted", 7),
+            ],
+        );
+        assert_eq!(Derived::between(&a, &b).innodb_rows_written_s, 6.0);
+    }
+
+    #[test]
+    fn every_metric_has_a_distinct_stable_key() {
+        let mut keys: Vec<&str> = Metric::ALL.iter().map(|m| m.key()).collect();
+        keys.sort_unstable();
+        let count = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), count, "duplicate metric key");
+        assert_eq!(count, Metric::ALL.len());
     }
 }

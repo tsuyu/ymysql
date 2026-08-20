@@ -5,6 +5,8 @@ use egui::RichText;
 use super::*;
 use crate::app::{App, LockView};
 use crate::db::collector::Command;
+use crate::deadlock::{Lock, Party};
+use crate::fmt_sql;
 
 impl App {
     pub fn lock_monitor_tab(&mut self, ui: &mut egui::Ui) {
@@ -18,6 +20,10 @@ impl App {
                     LockView::Blocking => format!("Blocking ({})", self.lock_waits.len()),
                     LockView::Transactions => format!("Transactions ({})", self.transactions.len()),
                     LockView::Metadata => format!("Metadata locks ({})", self.metadata_locks.len()),
+                    LockView::Deadlock => match &self.deadlock {
+                        Some(_) => "Deadlock (1)".to_string(),
+                        None => "Deadlock (0)".to_string(),
+                    },
                     LockView::Sessions => format!(
                         "Sessions ({})",
                         self.latest
@@ -29,6 +35,9 @@ impl App {
                 let mut text = RichText::new(label);
                 if v == LockView::Blocking && !self.lock_waits.is_empty() {
                     text = text.color(RED).strong();
+                }
+                if v == LockView::Deadlock && self.deadlock.is_some() {
+                    text = text.color(AMBER);
                 }
                 if ui.selectable_label(self.lock_view == v, text).clicked() {
                     self.lock_view = v;
@@ -49,7 +58,67 @@ impl App {
             LockView::Transactions => self.transactions_view(ui),
             LockView::Metadata => self.metadata_view(ui),
             LockView::Sessions => self.sessions_view(ui),
+            LockView::Deadlock => self.deadlock_view(ui),
         }
+    }
+
+    /// The latest deadlock InnoDB remembers. There is at most one, it does not
+    /// survive a restart, and it says nothing about how often deadlocks happen
+    /// -- `SHOW GLOBAL STATUS LIKE 'Innodb_deadlocks'` is not exposed by MySQL,
+    /// so frequency has to come from the error log.
+    fn deadlock_view(&mut self, ui: &mut egui::Ui) {
+        let Some(d) = self.deadlock.clone() else {
+            ui.colored_label(GREEN, "No deadlock since this server started.");
+            ui.label(
+                RichText::new("InnoDB keeps only the most recent one, and clears it on restart.")
+                    .small()
+                    .weak(),
+            );
+            return;
+        };
+
+        egui::ScrollArea::vertical()
+            .id_salt("deadlock_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(AMBER, RichText::new("Latest detected deadlock").strong());
+                    ui.separator();
+                    ui.label(RichText::new(&d.detected_at).small().weak());
+                    ui.separator();
+                    let tables = d.tables();
+                    if !tables.is_empty() {
+                        ui.label(format!("tables: {}", tables.join(", ")));
+                    }
+                    if ui.small_button("Copy report").clicked() {
+                        ui.ctx().copy_text(d.raw.clone());
+                    }
+                });
+                ui.add_space(6.0);
+
+                for party in &d.parties {
+                    let victim = d.victim == Some(party.index);
+                    deadlock_party(ui, party, victim);
+                    ui.add_space(6.0);
+                }
+
+                match d.victim {
+                    Some(n) => ui.label(
+                        RichText::new(format!(
+                            "InnoDB rolled back transaction ({n}). The other one \
+                             committed -- the application only saw an error on the \
+                             rolled-back side."
+                        ))
+                        .small()
+                        .weak(),
+                    ),
+                    None => ui.label(
+                        RichText::new("The report did not name a victim.")
+                            .small()
+                            .weak(),
+                    ),
+                };
+            });
     }
 
     fn blocking_view(&mut self, ui: &mut egui::Ui) {
@@ -375,4 +444,83 @@ fn query_block(ui: &mut egui::Ui, sql: &str, empty_note: &str) {
             .desired_rows(2)
             .interactive(false),
     );
+}
+/// One side of a deadlock as a card: who it was, what it ran, what it held and
+/// what it wanted.
+fn deadlock_party(ui: &mut egui::Ui, p: &Party, victim: bool) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let title = format!("({}) transaction {}", p.index, p.trx_id);
+            if victim {
+                ui.colored_label(RED, RichText::new(title).strong());
+                ui.colored_label(RED, "rolled back");
+            } else {
+                ui.label(RichText::new(title).strong());
+                ui.colored_label(GREEN, "survived");
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            stat(ui, "Thread", p.thread_id.to_string());
+            stat(
+                ui,
+                "User",
+                if p.user.is_empty() { "-" } else { &p.user }.to_string(),
+            );
+            stat(
+                ui,
+                "Host",
+                if p.host.is_empty() { "-" } else { &p.host }.to_string(),
+            );
+            stat(ui, "Active", format!("{}s", p.active_secs));
+            stat(ui, "Row locks", p.row_locks.to_string());
+            if !p.state.is_empty() {
+                stat(ui, "State", p.state.clone());
+            }
+        });
+        if !p.activity.is_empty() {
+            ui.label(RichText::new(&p.activity).small().weak());
+        }
+
+        if p.query.is_empty() {
+            ui.label(RichText::new("(no statement in the report)").small().weak());
+        } else {
+            let mut text = fmt_sql::format(&p.query);
+            ui.add(
+                egui::TextEdit::multiline(&mut text)
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(2)
+                    .interactive(false),
+            );
+            if ui.small_button("Copy statement").clicked() {
+                ui.ctx().copy_text(p.query.clone());
+            }
+        }
+
+        if let Some(w) = &p.waiting {
+            ui.colored_label(RED, format!("waiting for: {}", lock_summary(w)));
+        }
+        for h in &p.holds {
+            ui.colored_label(AMBER, format!("holds: {}", lock_summary(h)));
+        }
+    });
+}
+
+fn lock_summary(l: &Lock) -> String {
+    let mut out = String::new();
+    if l.record {
+        out.push_str("record lock");
+    } else {
+        out.push_str("table lock");
+    }
+    if !l.table.is_empty() {
+        out.push_str(&format!(" on {}", l.table));
+    }
+    if !l.index.is_empty() {
+        out.push_str(&format!(" ({})", l.index));
+    }
+    if !l.mode.is_empty() {
+        out.push_str(&format!(" mode {}", l.mode));
+    }
+    out
 }

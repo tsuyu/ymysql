@@ -16,7 +16,18 @@ impl App {
         let d = self.derived;
         ui.horizontal_wrapped(|ui| {
             stat(ui, "Queries/s", format!("{:.1}", d.qps));
-            stat(ui, "Transactions/s", format!("{:.1}", d.tps));
+            stat_help(
+                ui,
+                "Transactions/s",
+                format!("{:.1}", d.tps),
+                "Handler_commit + Handler_rollback per second.
+
+                 This counts every transaction, including the implicit one 
+                 around each autocommit statement -- so on a typical workload 
+                 it tracks queries per second rather than sitting near zero. 
+                 Com_commit, which many tools use, counts only explicit 
+                 COMMIT statements and reads 0 on an autocommit server.",
+            );
             stat_colored(
                 ui,
                 "Threads running",

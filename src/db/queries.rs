@@ -259,6 +259,56 @@ pub async fn perf_schema_enabled(conn: &mut Conn) -> bool {
         .unwrap_or(false)
 }
 
+/// `SHOW REPLICA STATUS` on 8.0.22+, `SHOW SLAVE STATUS` before it.
+///
+/// An empty grid means this server is not a replica. Needs the
+/// `REPLICATION CLIENT` privilege (`REPLICATION_APPLIER` is not enough), which
+/// the monitoring account in `scripts/monitor-user.sql` already has.
+pub async fn replica_status(conn: &mut Conn, caps: &Capabilities) -> Result<Grid> {
+    let sql = if caps.replica_terms {
+        "SHOW REPLICA STATUS"
+    } else {
+        "SHOW SLAVE STATUS"
+    };
+    let rows: Vec<Row> = conn
+        .query(sql)
+        .await
+        .with_context(|| format!("{sql} failed"))?;
+    Ok(to_grid(rows))
+}
+
+/// `SHOW MASTER STATUS` — where this server's binary log stands, which is what
+/// replicas read from. An empty grid means binary logging is off.
+///
+/// 8.4 renamed this to `SHOW BINARY LOG STATUS` and dropped the old spelling,
+/// but 8.0 accepts only the old one, so both are tried.
+pub async fn source_status(conn: &mut Conn) -> Result<Grid> {
+    match conn.query::<Row, _>("SHOW MASTER STATUS").await {
+        Ok(rows) => Ok(to_grid(rows)),
+        Err(_) => {
+            let rows: Vec<Row> = conn
+                .query("SHOW BINARY LOG STATUS")
+                .await
+                .context("neither SHOW MASTER STATUS nor SHOW BINARY LOG STATUS worked")?;
+            Ok(to_grid(rows))
+        }
+    }
+}
+
+/// Replicas currently connected to this server, as it sees them.
+pub async fn connected_replicas(conn: &mut Conn, caps: &Capabilities) -> Result<Grid> {
+    let sql = if caps.replica_terms {
+        "SHOW REPLICAS"
+    } else {
+        "SHOW SLAVE HOSTS"
+    };
+    let rows: Vec<Row> = conn
+        .query(sql)
+        .await
+        .with_context(|| format!("{sql} failed"))?;
+    Ok(to_grid(rows))
+}
+
 /// `SHOW ENGINE INNODB STATUS` — the report text from the third column.
 pub async fn engine_innodb_status(conn: &mut Conn) -> Result<String> {
     let row: Option<Row> = conn

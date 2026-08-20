@@ -16,8 +16,10 @@ use super::queries::{
 use super::schedule::{HeavyTask, Scheduler, ViewNeeds};
 use super::sql::{self, BrowseSpec, Change, SqlOutcome, StatementKind, TableSchema};
 use super::version::{Capabilities, ServerVersion};
+use crate::deadlock::{self, Deadlock};
 use crate::innodb::{EngineStatus, InnodbConfig, parse_engine_status};
 use crate::model::Sample;
+use crate::replication::{self, Replica, Source};
 use crate::store;
 
 /// Digest rows pulled per heavy tick.
@@ -109,7 +111,22 @@ pub enum Event {
     Advisor(Box<AdvisorData>),
     /// Long-running work started/finished, for the busy indicator.
     Busy(bool),
-    Innodb(Box<EngineStatus>),
+    Replication {
+        replicas: Vec<Replica>,
+        source: Option<Source>,
+        /// `SHOW REPLICAS` as it came back — the columns differ by version and
+        /// there is little to derive from them.
+        connected: Grid,
+        /// Set when the server refused the statement, which is almost always a
+        /// missing `REPLICATION CLIENT` grant.
+        error: Option<String>,
+    },
+    Innodb {
+        status: Box<EngineStatus>,
+        /// The latest deadlock InnoDB remembers, if it has seen one since the
+        /// server started.
+        deadlock: Option<Box<Deadlock>>,
+    },
     DumpProgress {
         table: String,
         table_index: usize,
@@ -521,9 +538,40 @@ async fn sample_once(
             }
             Err(e) => warn!("innodb_trx unavailable: {e:#}"),
         },
+        Some(HeavyTask::Replication) => {
+            let mut error = None;
+            let replicas = match queries::replica_status(&mut conn, &s.caps).await {
+                Ok(grid) => replication::parse_replicas(&grid),
+                Err(e) => {
+                    error = Some(format!("{e:#}"));
+                    Vec::new()
+                }
+            };
+            // A replica is usually also a source, and a source that is not a
+            // replica still has a position worth showing, so both are read.
+            let source = match queries::source_status(&mut conn).await {
+                Ok(grid) => replication::parse_source(&grid),
+                Err(e) => {
+                    warn!("source status unavailable: {e:#}");
+                    None
+                }
+            };
+            let connected = queries::connected_replicas(&mut conn, &s.caps)
+                .await
+                .unwrap_or_default();
+            let _ = ev.send(Event::Replication {
+                replicas,
+                source,
+                connected,
+                error,
+            });
+        }
         Some(HeavyTask::Innodb) => match queries::engine_innodb_status(&mut conn).await {
             Ok(text) => {
-                let _ = ev.send(Event::Innodb(Box::new(parse_engine_status(&text))));
+                let _ = ev.send(Event::Innodb {
+                    status: Box::new(parse_engine_status(&text)),
+                    deadlock: deadlock::parse(&text).map(Box::new),
+                });
             }
             Err(e) => warn!("engine status unavailable: {e:#}"),
         },

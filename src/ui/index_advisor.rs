@@ -38,6 +38,95 @@ impl App {
             }
         });
 
+        self.advisor_notes(ui);
+
+        if !self.advisor_ran {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("Run the analysis to see findings").weak());
+            });
+            return;
+        }
+
+        let kinds: Vec<&'static str> = self.advisor_kinds.iter().copied().collect();
+        let filter = self.advisor_filter;
+        let mut copy: Option<String> = None;
+
+        // One scroll area for the whole report. The suggestion cards are
+        // unbounded, and drawing them above the scroll pushed the findings
+        // list off the bottom of the panel with no way to reach it.
+        egui::ScrollArea::vertical()
+            .id_salt("advisor_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.suggestions_section(ui);
+                ui.separator();
+
+                // Kind filter chips.
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .selectable_label(self.advisor_filter.is_none(), "all")
+                        .clicked()
+                    {
+                        self.advisor_filter = None;
+                    }
+                    for k in kinds {
+                        if ui
+                            .selectable_label(self.advisor_filter == Some(k), k)
+                            .clicked()
+                        {
+                            self.advisor_filter = Some(k);
+                        }
+                    }
+                });
+                ui.separator();
+
+                let mut shown = 0;
+                for f in self.advisor.iter().filter(|f| match filter {
+                    Some(k) => f.kind == k,
+                    None => true,
+                }) {
+                    shown += 1;
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(
+                                severity_color(f.severity),
+                                RichText::new(f.severity.label().to_uppercase()).strong(),
+                            );
+                            ui.label(RichText::new(f.kind).strong());
+                            ui.label(RichText::new(&f.object).color(BLUE));
+                        });
+                        ui.label(&f.detail);
+                        if let Some(action) = &f.action {
+                            ui.add_space(2.0);
+                            let mut sql = action.clone();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut sql)
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(action.lines().count().min(4))
+                                    .interactive(false),
+                            );
+                            if ui.small_button("Copy SQL").clicked() {
+                                copy = Some(action.clone());
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+                if shown == 0 {
+                    ui.colored_label(GREEN, "Nothing to report.");
+                }
+            });
+
+        if let Some(sql) = copy {
+            ui.ctx().copy_text(sql);
+            self.push_log("copied remediation SQL");
+        }
+    }
+
+    /// Caveats that apply to the whole report, shown whether or not it has run.
+    fn advisor_notes(&mut self, ui: &mut egui::Ui) {
         if self.uptime_s > 0 && self.uptime_s < MIN_UPTIME_FOR_UNUSED_S {
             ui.label(
                 RichText::new(format!(
@@ -59,91 +148,10 @@ impl App {
                 .color(AMBER),
             );
         }
-
-        if self.advisor_ran {
-            self.suggestions_section(ui);
-        }
-
-        if !self.advisor_ran {
-            ui.add_space(20.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Run the analysis to see findings").weak());
-            });
-            return;
-        }
-        ui.separator();
-
-        // Kind filter chips.
-        let kinds: Vec<&'static str> = self.advisor_kinds.iter().copied().collect();
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .selectable_label(self.advisor_filter.is_none(), "all")
-                .clicked()
-            {
-                self.advisor_filter = None;
-            }
-            for k in kinds {
-                if ui
-                    .selectable_label(self.advisor_filter == Some(k), k)
-                    .clicked()
-                {
-                    self.advisor_filter = Some(k);
-                }
-            }
-        });
-        ui.separator();
-
-        let filter = self.advisor_filter;
-        let mut copy: Option<String> = None;
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let mut shown = 0;
-            for f in self.advisor.iter().filter(|f| match filter {
-                Some(k) => f.kind == k,
-                None => true,
-            }) {
-                shown += 1;
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(
-                            severity_color(f.severity),
-                            RichText::new(f.severity.label().to_uppercase()).strong(),
-                        );
-                        ui.label(RichText::new(f.kind).strong());
-                        ui.label(RichText::new(&f.object).color(BLUE));
-                    });
-                    ui.label(&f.detail);
-                    if let Some(action) = &f.action {
-                        ui.add_space(2.0);
-                        let mut sql = action.clone();
-                        ui.add(
-                            egui::TextEdit::multiline(&mut sql)
-                                .code_editor()
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(action.lines().count().min(4))
-                                .interactive(false),
-                        );
-                        if ui.small_button("Copy SQL").clicked() {
-                            copy = Some(action.clone());
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-            }
-            if shown == 0 {
-                ui.colored_label(GREEN, "Nothing to report.");
-            }
-        });
-
-        if let Some(sql) = copy {
-            ui.ctx().copy_text(sql);
-            self.push_log("copied remediation SQL");
-        }
     }
 
     /// Proposed composite indexes, worst first.
     fn suggestions_section(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Suggested indexes").heading());
             ui.label(

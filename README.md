@@ -20,7 +20,7 @@ Twelve tabs, in the order they appear:
 | **Dashboard** | Live stat cards (QPS, TPS, threads, slow queries, buffer pool hit, network, lock waits, firing alerts), rolling 15-minute plots, the five worst statements, and the raw `SHOW GLOBAL STATUS` table with per-second deltas |
 | **Top SQL** | Statement digests sorted by total/avg/max time, executions, rows examined or examined-per-sent; flags temp-disk tables and no-index executions; click a row to inspect |
 | **Query Inspector** | One digest in full: counters, statement text re-indented by the SQL formatter, `EXPLAIN` (SELECT only), a hand-off to the SQL tab, and recent executions from `events_statements_history_long` |
-| **Lock Monitor** | Blocking/waiting pairs as cards — PID, user, database, lock duration, locked table, index, lock mode, both statements, kill either side — plus open InnoDB transactions, metadata locks and the full session list |
+| **Lock Monitor** | Blocking/waiting pairs as cards — PID, user, database, lock duration, locked table, index, lock mode, both statements, kill either side — plus open InnoDB transactions, metadata locks, the full session list, and the latest detected deadlock |
 | **Index Advisor** | Missing composite indexes proposed from the real workload with estimated impact and ready DDL, plus duplicate/redundant indexes, unused indexes, full table scans, tables without a primary key and function-wrapped predicates |
 | **Historical Metrics** | Any metric over 15m–7d from the on-disk store, with rollups, store stats and CSV export |
 | **Alerts** | Threshold rules with a hold window, live rule state, a firing banner and a transition log |
@@ -29,6 +29,7 @@ Twelve tabs, in the order they appear:
 | **Dump** | Export a database to `.sql` — structure only, data only or both; table picker, optional `DROP TABLE IF EXISTS`, consistent snapshot, live progress, cancel |
 | **Connections** | Threads connected/running against `max_connections` with usage bands, breakdown by user and host, long-running and stale-idle session lists with per-row kill |
 | **InnoDB** | Buffer pool, dirty ratio, redo log and checkpoint age against redo capacity, history list length, row locks and disk I/O — each band-coloured with what the number means |
+| **Replication** | Each channel's IO and SQL threads, lag, apply backlog, relay log space, GTID position and thread errors; plus this server's own binary log position and connected replicas |
 
 ## Layout
 
@@ -53,6 +54,8 @@ Twelve tabs, in the order they appear:
 | [src/html_table.rs](src/html_table.rs) | HTML table export of a result grid |
 | [src/suggest.rs](src/suggest.rs) | Digest parser + composite index proposals |
 | [src/innodb.rs](src/innodb.rs) | `SHOW ENGINE INNODB STATUS` parser + health bands |
+| [src/deadlock.rs](src/deadlock.rs) | `LATEST DETECTED DEADLOCK` parser |
+| [src/replication.rs](src/replication.rs) | Replica/source status across the 5.7 and 8.0 column names |
 | [src/connections.rs](src/connections.rs) | Connection-pool grouping and classification |
 | [src/alerts.rs](src/alerts.rs) | Threshold state machine |
 | [src/store.rs](src/store.rs) | SQLite metric history on its own thread |
@@ -116,8 +119,8 @@ A monitor that stampedes the server it watches is worse than none, so the
 collector shapes its own load ([src/db/schedule.rs](src/db/schedule.rs)):
 
 - **One expensive fetch per tick.** Digests, lock waits, open transactions,
-  metadata locks and the InnoDB engine report rotate one per heavy tick instead
-  of firing together.
+  metadata locks, the InnoDB engine report and replication status rotate one per
+  heavy tick instead of firing together.
 - **Only what is on screen.** Each tab declares what it needs; tabs that show
   none of the above poll nothing but `SHOW GLOBAL STATUS`. Switching tabs
   fetches immediately rather than waiting out the rotation, and a task no
@@ -134,6 +137,22 @@ collector shapes its own load ([src/db/schedule.rs](src/db/schedule.rs)):
 
 Interactive work — console, browser, advisor, dump — runs on command, never on
 the tick.
+
+## What TPS counts
+
+`Com_commit` counts only *explicit* `COMMIT` statements. Most workloads run in
+autocommit, so on a server doing 900 queries a second that counter never moves
+and a transactions-per-second card reads `0.00` — correct, and useless.
+
+[src/model.rs](src/model.rs) derives TPS from `Handler_commit + Handler_rollback`
+instead, which counts the commit every statement performs, implicit ones
+included. Servers without the handler counters fall back to the `Com_` pair.
+Expect the number to track QPS on a read-heavy autocommit workload: each
+statement really is its own transaction.
+
+This changed after the first live run. Any `tps` history recorded before it is
+on the old definition — in practice a flat line at zero, which is why the
+storage key was left alone rather than migrated.
 
 ## Metric history
 
@@ -188,6 +207,57 @@ lines stay zero rather than costing the numbers that did parse.
   under Lock Monitor → Transactions.
 - **Row locks** — current waiters, total waits, average and max wait.
 - **Disk I/O** — data reads/writes/fsyncs, row rates, `innodb_io_capacity`.
+
+## Deadlocks
+
+Lock Monitor → **Deadlock** shows the last deadlock InnoDB detected: both
+transactions, the statement each was running, the locks each held, the lock each
+wanted, and which one was rolled back. The statements go through the SQL
+formatter, and **Copy report** yields the raw section for a ticket.
+
+It comes out of the same `SHOW ENGINE INNODB STATUS` report the InnoDB tab
+already reads, so it costs no extra query — [src/deadlock.rs](src/deadlock.rs)
+parses the `LATEST DETECTED DEADLOCK` section by marker lines rather than by
+offset, which is what keeps 5.7 and 8.0 on one code path, and anything it does
+not recognise stays available as raw text.
+
+Two limits worth knowing. InnoDB remembers exactly **one** deadlock, and forgets
+it on restart, so this is a snapshot and not a history — frequency has to come
+from the error log with `innodb_print_all_deadlocks=ON`. And the victim is the
+transaction that got the error; the other side committed, so the application may
+have no idea a deadlock happened at all.
+
+## Replication
+
+The **Replication** tab reads `SHOW REPLICA STATUS` on 8.0.22+ and
+`SHOW SLAVE STATUS` before it, one card per channel.
+
+MySQL 8.0.22 renamed nearly every column in that result — `Slave_IO_Running` to
+`Replica_IO_Running`, `Seconds_Behind_Master` to `Seconds_Behind_Source`, and so
+on — and kept the old spellings only in the *statement*, not in the output.
+Rather than branch on version, [src/replication.rs](src/replication.rs) looks up
+every field under both names and takes the first one actually present, which
+also covers MariaDB.
+
+Each card gives the two thread states, lag, relay log space, GTID auto-position
+and any thread error, plus one derived number: the **apply backlog**, the byte
+gap between what the receiver has fetched and what the applier has executed.
+When both threads are running and that gap is large, the SQL thread is the
+bottleneck rather than the network — the distinction that decides whether more
+bandwidth or more apply parallelism is the fix. It is only shown when both
+threads are on the same binary log file, where the subtraction means something.
+
+`Seconds_Behind_Source` reading NULL is treated as **not replicating**, not as
+caught up; that inversion is the classic way a broken replica reads as healthy.
+Lag turns amber at 30s and red at 300s, a configured `SOURCE_DELAY` is called out
+so a deliberate delay is not read as a fault, and the tab label itself colours
+when any channel is unhealthy so a stopped replica is visible from any screen.
+
+Below the channels is what this server looks like *as* a source: its binary log
+file and position, executed GTID set, and the replicas currently connected to
+it. Reading any of this needs the `REPLICATION CLIENT` privilege, which
+`scripts/monitor-user.sql` already grants; without it the tab says so rather
+than showing an empty screen.
 
 ## Index suggestions
 
@@ -451,7 +521,7 @@ UPDATE performance_schema.setup_instruments
 ## Development
 
 ```sh
-cargo test                    # 166 unit tests, no server required
+cargo test                    # 202 unit tests, no server required
 cargo clippy --all-targets
 cargo fmt
 cargo build --release
@@ -475,7 +545,12 @@ storage; Windows and Linux are covered by its defaults.
 
 ## Next
 
+- **Validation against a live server.** Nothing here has been run against real
+  MySQL yet; `docker compose up -d` brings up 5.7 on 3357 and 8.0 on 3380 for
+  exactly that.
 - Variables tab and a config-vs-workload advisor.
-- Replication tab (`replica_status_sql` already switches terminology).
+- `EXPLAIN ANALYZE` and `FORMAT=JSON` in the Query Inspector (8.0.18+).
+- Schema sizes from `information_schema.TABLES` — data and index bytes per table.
+- Default the long-running threshold to the server's own `long_query_time`.
 - Alert delivery beyond the app window (desktop toast, webhook).
 - Multi-server view: several profiles sampled side by side.

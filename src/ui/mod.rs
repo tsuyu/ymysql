@@ -9,6 +9,7 @@ pub mod index_advisor;
 pub mod innodb;
 pub mod inspector;
 pub mod lock_monitor;
+pub mod replication;
 pub mod sql_console;
 pub mod table_browser;
 pub mod top_sql;
@@ -36,6 +37,20 @@ pub fn severity_color(s: Severity) -> Color32 {
 /// A labelled number card.
 pub fn stat(ui: &mut egui::Ui, label: &str, value: String) {
     stat_colored(ui, label, value, None);
+}
+
+/// A stat card with an explanation on hover, for numbers whose meaning is not
+/// obvious from the label.
+pub fn stat_help(ui: &mut egui::Ui, label: &str, value: String, help: &str) {
+    egui::Frame::group(ui.style())
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(format!("{label} ⓘ")).small().weak());
+                ui.label(RichText::new(value).heading());
+            });
+        })
+        .response
+        .on_hover_text(help);
 }
 
 pub fn stat_colored(ui: &mut egui::Ui, label: &str, value: String, color: Option<Color32>) {

@@ -17,12 +17,14 @@ use crate::db::queries::{
 use crate::db::schedule::ViewNeeds;
 use crate::db::sql::{BrowseSpec, Change, SqlOutcome, TableInfo, TableSchema};
 use crate::db::version::{Capabilities, ServerVersion};
+use crate::deadlock::Deadlock;
 use crate::html_table;
 use crate::innodb::{EngineStatus, InnodbConfig};
 use crate::insert_sql;
 use crate::json_rows;
 use crate::model::{Derived, History, Metric, Sample};
 use crate::profiles::{Profile, Profiles, SavedQuery};
+use crate::replication::{self, Replica, Source};
 use crate::store::{self, StoreCmd, StoreEvent};
 use crate::suggest::{self, IndexSuggestion};
 use crate::ui;
@@ -46,10 +48,11 @@ pub enum Tab {
     Dump,
     Connections,
     Innodb,
+    Replication,
 }
 
 impl Tab {
-    pub const ORDER: [Tab; 12] = [
+    pub const ORDER: [Tab; 13] = [
         Tab::Dashboard,
         Tab::TopSql,
         Tab::Inspector,
@@ -62,6 +65,7 @@ impl Tab {
         Tab::Dump,
         Tab::Connections,
         Tab::Innodb,
+        Tab::Replication,
     ];
 
     pub fn label(self) -> &'static str {
@@ -78,6 +82,7 @@ impl Tab {
             Tab::Dump => "Dump",
             Tab::Connections => "Connections",
             Tab::Innodb => "InnoDB",
+            Tab::Replication => "Replication",
         }
     }
 }
@@ -89,14 +94,16 @@ pub enum LockView {
     Transactions,
     Metadata,
     Sessions,
+    Deadlock,
 }
 
 impl LockView {
-    pub const ORDER: [LockView; 4] = [
+    pub const ORDER: [LockView; 5] = [
         LockView::Blocking,
         LockView::Transactions,
         LockView::Metadata,
         LockView::Sessions,
+        LockView::Deadlock,
     ];
 }
 
@@ -231,6 +238,17 @@ pub struct App {
     pub innodb_config: InnodbConfig,
     /// Latest parsed `SHOW ENGINE INNODB STATUS`.
     pub engine_status: EngineStatus,
+    /// The most recent deadlock from the same report. InnoDB keeps only one,
+    /// and only until the server restarts.
+    pub deadlock: Option<Deadlock>,
+    /// One entry per replication channel; empty when this is not a replica.
+    pub replicas: Vec<Replica>,
+    /// This server's own binary log position, when logging is on.
+    pub source_status: Option<Source>,
+    /// `SHOW REPLICAS` output, verbatim.
+    pub connected_replicas: Grid,
+    /// Why the replication read failed, usually a missing grant.
+    pub replication_error: Option<String>,
     /// Seconds before a running statement counts as long-running.
     pub long_query_secs: i64,
     /// Seconds before a sleeping session counts as stale.
@@ -397,6 +415,11 @@ impl App {
             limits: ServerLimits::default(),
             innodb_config: InnodbConfig::default(),
             engine_status: EngineStatus::default(),
+            deadlock: None,
+            replicas: Vec::new(),
+            source_status: None,
+            connected_replicas: Grid::default(),
+            replication_error: None,
             long_query_secs: connections::DEFAULT_LONG_SECS,
             idle_secs: connections::DEFAULT_IDLE_SECS,
             prev: None,
@@ -745,30 +768,43 @@ impl App {
                 digests: true,
                 locks: true,
                 innodb: false,
+                replication: false,
             },
             Tab::TopSql | Tab::IndexAdvisor => ViewNeeds {
                 processlist: false,
                 digests: true,
                 locks: false,
                 innodb: false,
+                replication: false,
             },
             Tab::Locks => ViewNeeds {
                 processlist: true,
                 digests: false,
                 locks: true,
-                innodb: false,
+                // The latest deadlock rides along in the engine report.
+                innodb: true,
+                replication: false,
             },
             Tab::Connections => ViewNeeds {
                 processlist: true,
                 digests: false,
                 locks: false,
                 innodb: false,
+                replication: false,
             },
             Tab::Innodb => ViewNeeds {
                 processlist: false,
                 digests: false,
                 locks: false,
                 innodb: true,
+                replication: false,
+            },
+            Tab::Replication => ViewNeeds {
+                processlist: false,
+                digests: false,
+                locks: false,
+                innodb: false,
+                replication: true,
             },
             Tab::Inspector | Tab::Historical | Tab::Alerts | Tab::Sql | Tab::Tables | Tab::Dump => {
                 ViewNeeds::minimal()
@@ -928,6 +964,10 @@ impl App {
                     self.limits = limits;
                     self.innodb_config = *innodb_config;
                     self.engine_status = EngineStatus::default();
+                    self.deadlock = None;
+                    self.replicas.clear();
+                    self.source_status = None;
+                    self.replication_error = None;
                     if limits.max_connections == 0 {
                         self.push_log("could not read max_connections — usage % unavailable");
                     }
@@ -969,7 +1009,21 @@ impl App {
                 Event::Explain(grid) => self.explain = Some(grid),
                 Event::Advisor(data) => self.on_advisor(*data),
                 Event::Busy(b) => self.busy = b,
-                Event::Innodb(status) => self.engine_status = *status,
+                Event::Replication {
+                    replicas,
+                    source,
+                    connected,
+                    error,
+                } => {
+                    self.replicas = replicas;
+                    self.source_status = source;
+                    self.connected_replicas = connected;
+                    self.replication_error = error;
+                }
+                Event::Innodb { status, deadlock } => {
+                    self.engine_status = *status;
+                    self.deadlock = deadlock.map(|d| *d);
+                }
                 Event::DumpProgress {
                     table,
                     table_index,
@@ -1338,6 +1392,17 @@ impl eframe::App for App {
                     if tab == Tab::Alerts && self.alerts.firing_count() > 0 {
                         text = text.color(ui::RED).strong();
                     }
+                    // A replica that has stopped or fallen behind is worth
+                    // seeing without opening its tab.
+                    if tab == Tab::Replication {
+                        match replication::overall(&self.replicas) {
+                            Some(replication::Health::Bad) => {
+                                text = text.color(ui::RED).strong();
+                            }
+                            Some(replication::Health::Watch) => text = text.color(ui::AMBER),
+                            _ => {}
+                        }
+                    }
                     if ui.selectable_label(self.tab == tab, text).clicked() {
                         switch_to = Some(tab);
                     }
@@ -1364,6 +1429,7 @@ impl eframe::App for App {
                 Tab::Dump => self.dump_tab(ui),
                 Tab::Connections => self.connections_tab(ui),
                 Tab::Innodb => self.innodb_tab(ui),
+                Tab::Replication => self.replication_tab(ui),
             }
         });
 
