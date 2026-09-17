@@ -1,4 +1,4 @@
-# mysql_perf
+# yMySQL
 
 Desktop MySQL performance monitor and light client. Rust, egui/eframe GUI,
 `mysql_async` on a Tokio runtime, SQLite for metric history.
@@ -156,8 +156,12 @@ storage key was left alone rather than migrated.
 
 ## Metric history
 
-Samples land in SQLite (`%LOCALAPPDATA%\mysql_perf\metrics.db` on Windows,
-`$XDG_DATA_HOME/mysql_perf/metrics.db` otherwise), keyed by `user@host:port`.
+Samples land in SQLite (`%LOCALAPPDATA%\yMySQL\metrics.db` on Windows,
+`$XDG_DATA_HOME/yMySQL/metrics.db` otherwise), keyed by `user@host:port`.
+
+An install from before the rename (`mysql_perf`) is moved to the new directory
+on first launch, and passwords filed under the old credential-store service
+name are re-filed under `ymysql` the first time they are read.
 
 - Raw samples: 6 hours.
 - One-minute rollups (avg/min/max): 30 days.

@@ -172,7 +172,7 @@ pub fn insert_statement(table: &str, columns: &[String], rows: &[Vec<Value>]) ->
 
 pub fn preamble(schema: &str, server_version: &str, mode: DumpMode) -> String {
     format!(
-        "-- mysql_perf dump\n\
+        "-- yMySQL dump\n\
          -- database: {schema}\n\
          -- server:   {server_version}\n\
          -- contents: {}\n\

@@ -29,6 +29,9 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
+    // Carries an install from before the mysql_perf -> yMySQL rename.
+    store::migrate_legacy_dir();
+
     // The GUI runs on the main thread; all MySQL I/O runs on this runtime.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -41,12 +44,12 @@ fn main() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("mysql_perf"),
+            .with_title("yMySQL"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "mysql_perf",
+        "yMySQL",
         native_options,
         Box::new(|_cc| Ok(Box::new(app::App::new(collector, store)))),
     )

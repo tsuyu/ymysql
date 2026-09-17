@@ -152,7 +152,7 @@ mod tests {
     fn utf8_survives_and_the_bom_is_opt_in() {
         let g = grid(&["v"], &[&[Some("café ☕")]]);
         let mut path = std::env::temp_dir();
-        path.push(format!("mysql_perf_csv_{}.csv", std::process::id()));
+        path.push(format!("ymysql_csv_{}.csv", std::process::id()));
 
         write_file(&path, &g, false).unwrap();
         let plain = std::fs::read(&path).unwrap();

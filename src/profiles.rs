@@ -15,7 +15,11 @@ use crate::db::ConnConfig;
 use crate::store;
 
 /// Service name under which passwords are filed in the OS credential store.
-const KEYRING_SERVICE: &str = "mysql_perf";
+const KEYRING_SERVICE: &str = "ymysql";
+
+/// Service name used before the app was renamed to yMySQL. Passwords filed
+/// under it are still read, then re-filed under `KEYRING_SERVICE`.
+const LEGACY_KEYRING_SERVICE: &str = "mysql_perf";
 
 /// A statement saved against one profile, with the database it was written for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +160,11 @@ fn entry(cfg: &ConnConfig) -> Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, &account(cfg)).context("OS credential store unavailable")
 }
 
+fn legacy_entry(cfg: &ConnConfig) -> Result<keyring::Entry> {
+    keyring::Entry::new(LEGACY_KEYRING_SERVICE, &account(cfg))
+        .context("OS credential store unavailable")
+}
+
 pub fn save_password(cfg: &ConnConfig) -> Result<()> {
     entry(cfg)?
         .set_password(&cfg.password)
@@ -169,9 +178,23 @@ pub fn load_password(cfg: &ConnConfig) -> Option<String> {
         Ok(pw) => Some(pw),
         Err(e) => {
             info!("no stored password for {}: {e}", account(cfg));
-            None
+            load_legacy_password(cfg)
         }
     }
+}
+
+/// Reads a password filed under the pre-rename service name and re-files it
+/// under the current one, so the rename does not lose saved credentials. The
+/// old entry is left in place: deleting it is the user's call.
+fn load_legacy_password(cfg: &ConnConfig) -> Option<String> {
+    let pw = legacy_entry(cfg)
+        .and_then(|e| e.get_password().map_err(Into::into))
+        .ok()?;
+    match entry(cfg).and_then(|e| e.set_password(&pw).map_err(Into::into)) {
+        Ok(()) => info!("migrated stored password for {}", account(cfg)),
+        Err(e) => warn!("could not migrate password for {}: {e}", account(cfg)),
+    }
+    Some(pw)
 }
 
 pub fn forget_password(cfg: &ConnConfig) {
@@ -179,6 +202,11 @@ pub fn forget_password(cfg: &ConnConfig) {
         && let Err(err) = e.delete_credential()
     {
         info!("nothing to delete for {}: {err}", account(cfg));
+    }
+    if let Ok(e) = legacy_entry(cfg)
+        && let Err(err) = e.delete_credential()
+    {
+        info!("nothing to delete for legacy {}: {err}", account(cfg));
     }
 }
 
@@ -214,7 +242,7 @@ mod tests {
     fn temp_file(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "mysql_perf_profiles_{tag}_{}.json",
+            "ymysql_profiles_{tag}_{}.json",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&p);

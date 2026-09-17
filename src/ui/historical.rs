@@ -161,7 +161,7 @@ impl App {
         let to_ms = store::now_ms();
         let from_ms = to_ms - self.hist_range.secs() * 1000;
         let name = format!(
-            "mysql_perf_{}_{}.csv",
+            "ymysql_{}_{}.csv",
             self.server_label.replace([':', '@', '/', '\\', '.'], "_"),
             chrono::Local::now().format("%Y%m%d_%H%M%S")
         );

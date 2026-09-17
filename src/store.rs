@@ -89,15 +89,44 @@ impl Handle {
     }
 }
 
-/// Where this app keeps its files: `%LOCALAPPDATA%\mysql_perf` on Windows,
-/// `$XDG_DATA_HOME/mysql_perf` (or `~/.local/share/mysql_perf`) elsewhere.
+/// Directory name used before the app was renamed to yMySQL. Kept only so
+/// that `migrate_legacy_dir` can find an existing install.
+const LEGACY_DIR: &str = "mysql_perf";
+
+/// Where this app keeps its files: `%LOCALAPPDATA%\yMySQL` on Windows,
+/// `$XDG_DATA_HOME/yMySQL` (or `~/.local/share/yMySQL`) elsewhere.
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
+    base_dir().join("yMySQL")
+}
+
+fn base_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_DATA_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("mysql_perf")
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Moves a pre-rename `mysql_perf` directory to the current one, so metric
+/// history and saved profiles survive the rename. Only runs when the new
+/// directory does not exist yet; never overwrites anything.
+pub fn migrate_legacy_dir() {
+    let new = data_dir();
+    if new.exists() {
+        return;
+    }
+    let old = base_dir().join(LEGACY_DIR);
+    if !old.is_dir() {
+        return;
+    }
+    match std::fs::rename(&old, &new) {
+        Ok(()) => info!("moved {} to {}", old.display(), new.display()),
+        Err(e) => warn!(
+            "could not move {} to {}: {e} — starting with an empty store",
+            old.display(),
+            new.display()
+        ),
+    }
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -381,7 +410,7 @@ mod tests {
 
     fn temp_db() -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("mysql_perf_test_{}.db", std::process::id()));
+        p.push(format!("ymysql_test_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -439,7 +468,7 @@ mod tests {
     #[test]
     fn rollup_folds_old_raw_rows() {
         let mut path = std::env::temp_dir();
-        path.push(format!("mysql_perf_rollup_{}.db", std::process::id()));
+        path.push(format!("ymysql_rollup_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let mut conn = open(&path).unwrap();
