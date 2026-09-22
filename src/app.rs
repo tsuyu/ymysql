@@ -375,6 +375,9 @@ pub struct App {
     pub status_filter: String,
     pub log: VecDeque<String>,
     pub busy: bool,
+    /// A console statement is running. Tracked apart from `busy`, which is
+    /// raised by any job: only this one offers a Cancel.
+    pub console_running: bool,
     pub last_error: Option<String>,
 }
 
@@ -504,6 +507,7 @@ impl App {
             status_filter: String::new(),
             log: VecDeque::new(),
             busy: false,
+            console_running: false,
             last_error: None,
         }
     }
@@ -985,6 +989,12 @@ impl App {
                 }
                 Event::Disconnected => {
                     self.state = ConnState::Disconnected;
+                    // Jobs from the old session are abandoned, so their
+                    // finishing events will never arrive to clear these.
+                    self.busy = false;
+                    self.console_running = false;
+                    self.dump_running = false;
+                    self.dump_progress = None;
                     self.push_log("disconnected");
                 }
                 Event::Error(e) => {
@@ -1009,6 +1019,7 @@ impl App {
                 Event::Explain(grid) => self.explain = Some(grid),
                 Event::Advisor(data) => self.on_advisor(*data),
                 Event::Busy(b) => self.busy = b,
+                Event::SqlBusy(b) => self.console_running = b,
                 Event::Replication {
                     replicas,
                     source,
@@ -1075,10 +1086,14 @@ impl App {
                     self.insert_opts.table.clear();
                 }
                 Event::SqlError(e) => {
-                    self.dump_running = false;
-                    self.dump_progress = None;
                     self.console_error = Some(e.clone());
                     self.push_log(format!("sql: {e}"));
+                }
+                Event::DumpFailed(e) => {
+                    self.dump_running = false;
+                    self.dump_progress = None;
+                    self.last_error = Some(format!("dump: {e}"));
+                    self.push_log(format!("dump failed: {e}"));
                 }
                 Event::Schemas(v) => {
                     if let Some(cur) = &self.console_schema

@@ -241,10 +241,7 @@ mod tests {
 
     fn temp_file(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "ymysql_profiles_{tag}_{}.json",
-            std::process::id()
-        ));
+        p.push(format!("ymysql_profiles_{tag}_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }

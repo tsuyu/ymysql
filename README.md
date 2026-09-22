@@ -138,6 +138,28 @@ collector shapes its own load ([src/db/schedule.rs](src/db/schedule.rs)):
 Interactive work — console, browser, advisor, dump — runs on command, never on
 the tick.
 
+## Nothing blocks anything else
+
+Every job gets its own task and its own pooled connection, so a long dump or a
+slow console statement no longer stops sampling or holds up the next command
+([src/db/collector.rs](src/db/collector.rs)). The command loop stays free, which
+is what makes cancelling work at all.
+
+- **Cancel a statement.** While a console statement runs, the Run button is
+  replaced by a spinner and **Cancel**, which issues `KILL QUERY` against the
+  exact connection that statement landed on. The connection survives, so the
+  session and its default database are kept. Statements the user wrote are the
+  one thing with no time limit: only they know how long their own query should
+  take.
+- **Cancel a dump.** The dump stops at the next batch.
+- **Bounded waits elsewhere.** Connecting gives up after 10s rather than waiting
+  out the operating system's TCP timeout; a sample is abandoned after 20s and
+  retried on the next tick; schema and table lists, `EXPLAIN`, the inspector and
+  the advisor are capped at 30s.
+- **Late results are discarded.** Disconnecting or connecting somewhere else
+  retires the session. A job still running finishes into the void rather than
+  dropping its result into a different server's screen.
+
 ## What TPS counts
 
 `Com_commit` counts only *explicit* `COMMIT` statements. Most workloads run in
@@ -525,7 +547,7 @@ UPDATE performance_schema.setup_instruments
 ## Development
 
 ```sh
-cargo test                    # 202 unit tests, no server required
+cargo test                    # 208 unit tests, no server required
 cargo clippy --all-targets
 cargo fmt
 cargo build --release

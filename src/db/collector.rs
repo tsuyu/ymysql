@@ -1,6 +1,8 @@
 //! Background sampler. Owns the connection pool and does all database work off
 //! the UI thread; the GUI only drains `Event`s and sends `Command`s.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use mysql_async::Pool;
@@ -27,6 +29,31 @@ const TOP_SQL_LIMIT: u32 = 100;
 /// Executions shown in the query inspector.
 const SAMPLE_LIMIT: u32 = 20;
 
+/// How long a connect attempt may run before it is abandoned. Without this the
+/// wait is the operating system's TCP timeout, which on an unreachable host is
+/// twenty seconds or more with nothing to cancel it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A sample that takes this long is abandoned and the next tick tries again. A
+/// wedged server must never hold the sampler open indefinitely.
+const SAMPLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bound for metadata reads: schema and table lists, `EXPLAIN`, the inspector
+/// and the advisor. Statements the user wrote are deliberately not bounded —
+/// see `Command::CancelSql`.
+const META_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs `fut`, giving up after `limit`. The abandoned future is dropped, which
+/// returns its pooled connection to the recycler for cleanup.
+async fn with_timeout<T>(
+    limit: Duration,
+    what: &str,
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r,
+        Err(_) => anyhow::bail!("{what} timed out after {}s", limit.as_secs()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     Connect(Box<ConnConfig>),
@@ -51,6 +78,9 @@ pub enum Command {
     RunDump(Box<DumpSpec>),
     /// Ask a running dump to stop at the next batch.
     CancelDump,
+    /// `KILL QUERY` the console statement that is running, if any. The
+    /// connection survives, so the session and its default database do not.
+    CancelSql,
     /// Stop sampling entirely without dropping the connection.
     SetPaused(bool),
 
@@ -134,6 +164,9 @@ pub enum Event {
         rows: u64,
     },
     DumpDone(Box<DumpStats>),
+    /// The dump ended badly. Its own event because jobs now run side by side:
+    /// a failing table list must not clear the running dump's state.
+    DumpFailed(String),
     /// Sampling cost feedback: how long a poll took and the interval in force.
     Load {
         sample_ms: f64,
@@ -141,6 +174,9 @@ pub enum Event {
         backed_off: bool,
     },
 
+    /// A console statement started or finished. Separate from `Busy`, which
+    /// now covers several jobs at once: only this one can be cancelled.
+    SqlBusy(bool),
     SqlResult(Box<SqlOutcome>),
     /// Console/browser failure, kept apart from the sampler's error stream.
     SqlError(String),
@@ -179,6 +215,7 @@ impl Handle {
     }
 }
 
+#[derive(Clone)]
 struct Session {
     pool: Pool,
     caps: Capabilities,
@@ -187,6 +224,92 @@ struct Session {
 impl Session {
     async fn close(self) {
         let _ = self.pool.disconnect().await;
+    }
+}
+
+/// Event sink for a spawned job.
+///
+/// Long work runs off the command loop, so a result can arrive after the user
+/// has disconnected or connected somewhere else. Each job carries the epoch of
+/// the session it was started for; once that epoch is stale its events are
+/// dropped rather than shown against a different server.
+#[derive(Clone)]
+struct JobEv {
+    ev: UnboundedSender<Event>,
+    epoch: u64,
+    current: Arc<AtomicU64>,
+}
+
+impl JobEv {
+    fn is_current(&self) -> bool {
+        self.epoch == self.current.load(Ordering::SeqCst)
+    }
+
+    fn send(&self, e: Event) {
+        if self.is_current() {
+            let _ = self.ev.send(e);
+        }
+    }
+}
+
+/// Raises the busy indicator while at least one job is running. Jobs overlap
+/// now, so this counts rather than toggling: the indicator clears when the
+/// last one finishes, including when a job is dropped or panics.
+struct BusyGuard {
+    n: Arc<AtomicUsize>,
+    ev: UnboundedSender<Event>,
+}
+
+impl BusyGuard {
+    fn new(n: &Arc<AtomicUsize>, ev: &UnboundedSender<Event>) -> Self {
+        if n.fetch_add(1, Ordering::SeqCst) == 0 {
+            let _ = ev.send(Event::Busy(true));
+        }
+        Self {
+            n: n.clone(),
+            ev: ev.clone(),
+        }
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        if self.n.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _ = self.ev.send(Event::Busy(false));
+        }
+    }
+}
+
+/// Connection id of the console statement that is running, if any, so that
+/// `Command::CancelSql` can `KILL QUERY` it. Zero means nothing is running.
+/// Only the console registers here: sampler and metadata reads are bounded by
+/// a timeout instead, and cancelling those would just break the display.
+#[derive(Clone, Default)]
+struct Inflight(Arc<AtomicU32>);
+
+impl Inflight {
+    fn running_id(&self) -> Option<u32> {
+        match self.0.load(Ordering::SeqCst) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    /// Registers `id` until the returned guard drops.
+    fn register(&self, id: u32) -> InflightGuard {
+        self.0.store(id, Ordering::SeqCst);
+        InflightGuard(self.0.clone(), id)
+    }
+}
+
+struct InflightGuard(Arc<AtomicU32>, u32);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        // Compare first: a slower statement may already have claimed the slot.
+        let _ = self
+            .0
+            .compare_exchange(self.1, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
@@ -209,6 +332,38 @@ fn new_ticker(ms: u64) -> tokio::time::Interval {
     t
 }
 
+/// Starts `f` off the command loop.
+///
+/// Long work — a dump, a console statement, the advisor — used to be awaited
+/// inside the `select!`, which stopped sampling and left every later command,
+/// cancellation included, sitting unread in the channel. Each job now gets its
+/// own task and its own pooled connection; the loop returns to the select
+/// immediately.
+fn spawn_job<F, Fut>(
+    session: &Session,
+    ev: &UnboundedSender<Event>,
+    epoch: &Arc<AtomicU64>,
+    busy: &Arc<AtomicUsize>,
+    show_busy: bool,
+    f: F,
+) where
+    F: FnOnce(Session, JobEv) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let session = session.clone();
+    let jev = JobEv {
+        ev: ev.clone(),
+        epoch: epoch.load(Ordering::SeqCst),
+        current: epoch.clone(),
+    };
+    // Taken before the spawn so the indicator is up by the time the UI looks.
+    let guard = show_busy.then(|| BusyGuard::new(busy, ev));
+    tokio::spawn(async move {
+        let _guard = guard;
+        f(session, jev).await;
+    });
+}
+
 async fn run(mut cmd_rx: UnboundedReceiver<Command>, ev: UnboundedSender<Event>) {
     let started = Instant::now();
     let mut session: Option<Session> = None;
@@ -216,7 +371,12 @@ async fn run(mut cmd_rx: UnboundedReceiver<Command>, ev: UnboundedSender<Event>)
     let mut ticker = new_ticker(sched.interval_ms());
     let mut allow_writes = false;
     let mut server_version = ServerVersion::default();
-    let dump_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dump_cancel = Arc::new(AtomicBool::new(false));
+    let busy = Arc::new(AtomicUsize::new(0));
+    let inflight = Inflight::default();
+    // Bumped on every connect and disconnect. Jobs started against an earlier
+    // session finish into a stale epoch and their results are discarded.
+    let epoch = Arc::new(AtomicU64::new(0));
 
     loop {
         tokio::select! {
@@ -224,9 +384,10 @@ async fn run(mut cmd_rx: UnboundedReceiver<Command>, ev: UnboundedSender<Event>)
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     Command::Connect(cfg) => {
-                        if let Some(s) = session.take() { s.close().await; }
+                        epoch.fetch_add(1, Ordering::SeqCst);
+                        close_in_background(session.take());
                         let _ = ev.send(Event::Connecting(cfg.label()));
-                        match connect(&cfg).await {
+                        match with_timeout(CONNECT_TIMEOUT, "connect", connect(&cfg)).await {
                             Ok((s, version, uptime_s, limits, innodb_config)) => {
                                 info!(%version, "connected");
                                 server_version = version.clone();
@@ -250,7 +411,11 @@ async fn run(mut cmd_rx: UnboundedReceiver<Command>, ev: UnboundedSender<Event>)
                         }
                     }
                     Command::Disconnect => {
-                        if let Some(s) = session.take() { s.close().await; }
+                        epoch.fetch_add(1, Ordering::SeqCst);
+                        // Not awaited: closing the pool waits for every
+                        // connection to come back, and a console statement
+                        // still running holds one.
+                        close_in_background(session.take());
                         let _ = ev.send(Event::Disconnected);
                     }
                     Command::SetInterval(ms) => {
@@ -260,30 +425,32 @@ async fn run(mut cmd_rx: UnboundedReceiver<Command>, ev: UnboundedSender<Event>)
                     Command::SetViews(needs) => sched.set_needs(needs),
 
                     Command::CancelDump => {
-                        dump_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        dump_cancel.store(true, Ordering::Relaxed);
+                    }
+
+                    Command::CancelSql => {
+                        let Some(s) = &session else { continue };
+                        let Some(id) = inflight.running_id() else { continue };
+                        spawn_job(s, &ev, &epoch, &busy, false, move |s, jev| async move {
+                            // The statement itself reports the interruption, so
+                            // only a failure to cancel is worth saying.
+                            if let Err(e) = kill_query(&s, id).await {
+                                jev.send(Event::SqlError(format!("cancel: {e:#}")));
+                            }
+                        });
                     }
 
                     Command::RunDump(spec) => {
                         let Some(s) = &session else { continue };
-                        dump_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-                        let _ = ev.send(Event::Busy(true));
-
-                        // The dump holds one connection for its whole run; the
-                        // sampler keeps using the rest of the pool meanwhile.
-                        let result = run_dump(
-                            s,
-                            &spec,
-                            &server_version.to_string(),
-                            dump_cancel.clone(),
-                            &ev,
-                        )
-                        .await;
-
-                        match result {
-                            Ok(stats) => { let _ = ev.send(Event::DumpDone(Box::new(stats))); }
-                            Err(e) => { let _ = ev.send(Event::SqlError(format!("dump: {e:#}"))); }
-                        }
-                        let _ = ev.send(Event::Busy(false));
+                        dump_cancel.store(false, Ordering::Relaxed);
+                        let cancel = dump_cancel.clone();
+                        let version = server_version.to_string();
+                        spawn_job(s, &ev, &epoch, &busy, true, move |s, jev| async move {
+                            match run_dump(&s, &spec, &version, cancel, &jev).await {
+                                Ok(stats) => jev.send(Event::DumpDone(Box::new(stats))),
+                                Err(e) => jev.send(Event::DumpFailed(format!("{e:#}"))),
+                            }
+                        });
                     }
                     Command::SetPaused(paused) => {
                         sched.set_paused(paused);
@@ -291,49 +458,44 @@ async fn run(mut cmd_rx: UnboundedReceiver<Command>, ev: UnboundedSender<Event>)
                     }
                     Command::RefreshHeavy => sched.force_heavy(),
                     Command::KillThread(id) => {
-                        if let Some(s) = &session
-                            && let Err(e) = kill(s, id).await
-                        {
-                            let _ = ev.send(Event::Error(format!("KILL {id}: {e:#}")));
-                        }
+                        let Some(s) = &session else { continue };
+                        spawn_job(s, &ev, &epoch, &busy, false, move |s, jev| async move {
+                            if let Err(e) = kill(&s, id).await {
+                                jev.send(Event::Error(format!("KILL {id}: {e:#}")));
+                            }
+                        });
                     }
                     Command::InspectDigest(digest) => {
-                        if let Some(s) = &session {
-                            match inspect(s, &digest).await {
-                                Ok((row, samples)) => {
-                                    let _ = ev.send(Event::DigestDetail {
-                                        digest,
-                                        row: row.map(Box::new),
-                                        samples,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = ev.send(Event::Error(format!("inspect: {e:#}")));
-                                }
+                        let Some(s) = &session else { continue };
+                        spawn_job(s, &ev, &epoch, &busy, false, move |s, jev| async move {
+                            match with_timeout(META_TIMEOUT, "inspect", inspect(&s, &digest)).await {
+                                Ok((row, samples)) => jev.send(Event::DigestDetail {
+                                    digest,
+                                    row: row.map(Box::new),
+                                    samples,
+                                }),
+                                Err(e) => jev.send(Event::Error(format!("inspect: {e:#}"))),
                             }
-                        }
+                        });
                     }
                     Command::Explain { schema, sql } => {
-                        if let Some(s) = &session {
-                            match run_explain(s, &schema, &sql).await {
-                                Ok(grid) => { let _ = ev.send(Event::Explain(grid)); }
-                                Err(e) => {
-                                    let _ = ev.send(Event::Error(format!("explain: {e:#}")));
-                                }
+                        let Some(s) = &session else { continue };
+                        spawn_job(s, &ev, &epoch, &busy, false, move |s, jev| async move {
+                            let fut = run_explain(&s, &schema, &sql);
+                            match with_timeout(META_TIMEOUT, "EXPLAIN", fut).await {
+                                Ok(grid) => jev.send(Event::Explain(grid)),
+                                Err(e) => jev.send(Event::Error(format!("explain: {e:#}"))),
                             }
-                        }
+                        });
                     }
                     Command::RunAdvisor => {
-                        if let Some(s) = &session {
-                            let _ = ev.send(Event::Busy(true));
-                            match advisor_data(s).await {
-                                Ok(data) => { let _ = ev.send(Event::Advisor(Box::new(data))); }
-                                Err(e) => {
-                                    let _ = ev.send(Event::Error(format!("advisor: {e:#}")));
-                                }
+                        let Some(s) = &session else { continue };
+                        spawn_job(s, &ev, &epoch, &busy, true, move |s, jev| async move {
+                            match with_timeout(META_TIMEOUT, "advisor", advisor_data(&s)).await {
+                                Ok(data) => jev.send(Event::Advisor(Box::new(data))),
+                                Err(e) => jev.send(Event::Error(format!("advisor: {e:#}"))),
                             }
-                            let _ = ev.send(Event::Busy(false));
-                        }
+                        });
                     }
 
                     Command::SetWriteMode(on) => {
@@ -348,58 +510,72 @@ async fn run(mut cmd_rx: UnboundedReceiver<Command>, ev: UnboundedSender<Event>)
                             let _ = ev.send(Event::SqlError(read_only_message(kind)));
                             continue;
                         }
-                        let _ = ev.send(Event::Busy(true));
-                        let out = run_sql(s, schema.as_deref(), &stmt).await;
-                        match out {
-                            Ok(out) => { let _ = ev.send(Event::SqlResult(Box::new(out))); }
-                            Err(e) => { let _ = ev.send(Event::SqlError(format!("{e:#}"))); }
-                        }
-                        let _ = ev.send(Event::Busy(false));
+                        // Deliberately unbounded: only the user knows how long
+                        // their own statement should take. Cancel kills it.
+                        let inflight = inflight.clone();
+                        spawn_job(s, &ev, &epoch, &busy, true, move |s, jev| async move {
+                            jev.send(Event::SqlBusy(true));
+                            match run_sql(&s, schema.as_deref(), &stmt, &inflight).await {
+                                Ok(out) => jev.send(Event::SqlResult(Box::new(out))),
+                                Err(e) => jev.send(Event::SqlError(format!("{e:#}"))),
+                            }
+                            jev.send(Event::SqlBusy(false));
+                        });
                     }
 
                     Command::ListSchemas => {
                         let Some(s) = &session else { continue };
-                        match list_schemas(s).await {
-                            Ok(v) => { let _ = ev.send(Event::Schemas(v)); }
-                            Err(e) => { let _ = ev.send(Event::SqlError(format!("{e:#}"))); }
-                        }
+                        spawn_job(s, &ev, &epoch, &busy, false, move |s, jev| async move {
+                            match with_timeout(META_TIMEOUT, "schema list", list_schemas(&s)).await {
+                                Ok(v) => jev.send(Event::Schemas(v)),
+                                Err(e) => jev.send(Event::SqlError(format!("{e:#}"))),
+                            }
+                        });
                     }
 
                     Command::ListTables(schema) => {
                         let Some(s) = &session else { continue };
-                        match list_tables(s, &schema).await {
-                            Ok(tables) => { let _ = ev.send(Event::Tables { schema, tables }); }
-                            Err(e) => { let _ = ev.send(Event::SqlError(format!("{e:#}"))); }
-                        }
+                        spawn_job(s, &ev, &epoch, &busy, false, move |s, jev| async move {
+                            let fut = list_tables(&s, &schema);
+                            match with_timeout(META_TIMEOUT, "table list", fut).await {
+                                Ok(tables) => jev.send(Event::Tables { schema, tables }),
+                                Err(e) => jev.send(Event::SqlError(format!("{e:#}"))),
+                            }
+                        });
                     }
 
                     Command::DescribeTable { schema, table } => {
                         let Some(s) = &session else { continue };
-                        match describe(s, &schema, &table).await {
-                            Ok(t) => { let _ = ev.send(Event::TableSchema(Box::new(t))); }
-                            Err(e) => { let _ = ev.send(Event::SqlError(format!("{e:#}"))); }
-                        }
+                        spawn_job(s, &ev, &epoch, &busy, false, move |s, jev| async move {
+                            let fut = describe(&s, &schema, &table);
+                            match with_timeout(META_TIMEOUT, "DESCRIBE", fut).await {
+                                Ok(t) => jev.send(Event::TableSchema(Box::new(t))),
+                                Err(e) => jev.send(Event::SqlError(format!("{e:#}"))),
+                            }
+                        });
                     }
 
                     Command::Browse(spec) => {
                         let Some(s) = &session else { continue };
-                        match browse(s, &spec).await {
-                            Ok(out) => {
-                                let _ = ev.send(Event::BrowseResult {
+                        spawn_job(s, &ev, &epoch, &busy, true, move |s, jev| async move {
+                            match browse(&s, &spec).await {
+                                Ok(out) => jev.send(Event::BrowseResult {
                                     spec,
                                     outcome: Box::new(out),
-                                });
+                                }),
+                                Err(e) => jev.send(Event::SqlError(format!("{e:#}"))),
                             }
-                            Err(e) => { let _ = ev.send(Event::SqlError(format!("{e:#}"))); }
-                        }
+                        });
                     }
 
                     Command::CountRows(spec) => {
                         let Some(s) = &session else { continue };
-                        match count_rows(s, &spec).await {
-                            Ok(n) => { let _ = ev.send(Event::RowCount(n)); }
-                            Err(e) => { let _ = ev.send(Event::SqlError(format!("{e:#}"))); }
-                        }
+                        spawn_job(s, &ev, &epoch, &busy, false, move |s, jev| async move {
+                            match count_rows(&s, &spec).await {
+                                Ok(n) => jev.send(Event::RowCount(n)),
+                                Err(e) => jev.send(Event::SqlError(format!("{e:#}"))),
+                            }
+                        });
                     }
 
                     Command::ApplyChanges(changes) => {
@@ -410,12 +586,12 @@ async fn run(mut cmd_rx: UnboundedReceiver<Command>, ev: UnboundedSender<Event>)
                             ));
                             continue;
                         }
-                        let _ = ev.send(Event::Busy(true));
-                        match apply_changes(s, &changes).await {
-                            Ok(n) => { let _ = ev.send(Event::ChangesApplied(n)); }
-                            Err(e) => { let _ = ev.send(Event::SqlError(format!("{e:#}"))); }
-                        }
-                        let _ = ev.send(Event::Busy(false));
+                        spawn_job(s, &ev, &epoch, &busy, true, move |s, jev| async move {
+                            match apply_changes(&s, &changes).await {
+                                Ok(n) => jev.send(Event::ChangesApplied(n)),
+                                Err(e) => jev.send(Event::SqlError(format!("{e:#}"))),
+                            }
+                        });
                     }
                 }
             }
@@ -426,7 +602,8 @@ async fn run(mut cmd_rx: UnboundedReceiver<Command>, ev: UnboundedSender<Event>)
                 let want_processlist = sched.needs_processlist();
 
                 let began = Instant::now();
-                let outcome = sample_once(s, started, want_processlist, heavy, &ev).await;
+                let fut = sample_once(s, started, want_processlist, heavy, &ev);
+                let outcome = with_timeout(SAMPLE_TIMEOUT, "sample", fut).await;
                 let elapsed_ms = began.elapsed().as_secs_f64() * 1000.0;
 
                 match outcome {
@@ -460,7 +637,18 @@ async fn run(mut cmd_rx: UnboundedReceiver<Command>, ev: UnboundedSender<Event>)
     }
 
     if let Some(s) = session.take() {
-        s.close().await;
+        // Bounded: a connection wedged mid-statement must not hold up exit.
+        let _ = tokio::time::timeout(Duration::from_secs(2), s.close()).await;
+    }
+}
+
+/// Drops a session without waiting for it. `Pool::disconnect` waits for every
+/// connection to return, and a job still running holds one.
+fn close_in_background(session: Option<Session>) {
+    if let Some(s) = session {
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(5), s.close()).await;
+        });
     }
 }
 
@@ -631,13 +819,13 @@ async fn run_dump(
     s: &Session,
     spec: &DumpSpec,
     server_version: &str,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ev: &UnboundedSender<Event>,
+    cancel: Arc<AtomicBool>,
+    ev: &JobEv,
 ) -> anyhow::Result<DumpStats> {
     let mut conn = s.pool.get_conn().await?;
     let ev = ev.clone();
     dump::run(&mut conn, spec, server_version, cancel, move |p| {
-        let _ = ev.send(Event::DumpProgress {
+        ev.send(Event::DumpProgress {
             table: p.table,
             table_index: p.table_index,
             table_count: p.table_count,
@@ -647,8 +835,16 @@ async fn run_dump(
     .await
 }
 
-async fn run_sql(s: &Session, schema: Option<&str>, stmt: &str) -> anyhow::Result<SqlOutcome> {
+async fn run_sql(
+    s: &Session,
+    schema: Option<&str>,
+    stmt: &str,
+    inflight: &Inflight,
+) -> anyhow::Result<SqlOutcome> {
     let mut conn = s.pool.get_conn().await?;
+    // Published so Cancel can KILL QUERY this exact connection. Held until the
+    // statement is done, whichever way it ends.
+    let _running = inflight.register(conn.id());
     // Pooled connections are reused, so the default database has to be set on
     // whichever one this statement lands on.
     if let Some(schema) = schema {
@@ -692,4 +888,118 @@ async fn kill(s: &Session, id: u64) -> anyhow::Result<()> {
     let mut conn = s.pool.get_conn().await?;
     conn.query_drop(format!("KILL {id}")).await?;
     Ok(())
+}
+
+/// Interrupts the statement running on `id` and leaves the connection open, so
+/// it goes back to the pool with its session and default database intact.
+async fn kill_query(s: &Session, id: u32) -> anyhow::Result<()> {
+    use mysql_async::prelude::Queryable;
+    let mut conn = s.pool.get_conn().await?;
+    conn.query_drop(format!("KILL QUERY {id}")).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn drain(rx: &mut UnboundedReceiver<Event>) -> Vec<bool> {
+        let mut out = Vec::new();
+        while let Ok(Event::Busy(b)) = rx.try_recv() {
+            out.push(b);
+        }
+        out
+    }
+
+    #[test]
+    fn busy_is_raised_once_and_cleared_by_the_last_job() {
+        let (tx, mut rx) = unbounded_channel();
+        let n = Arc::new(AtomicUsize::new(0));
+
+        let a = BusyGuard::new(&n, &tx);
+        let b = BusyGuard::new(&n, &tx);
+        assert_eq!(drain(&mut rx), vec![true], "only the first job raises it");
+
+        drop(a);
+        assert!(drain(&mut rx).is_empty(), "one job still running");
+
+        drop(b);
+        assert_eq!(drain(&mut rx), vec![false]);
+    }
+
+    #[test]
+    fn a_stale_job_cannot_send() {
+        let (tx, mut rx) = unbounded_channel();
+        let current = Arc::new(AtomicU64::new(7));
+        let jev = JobEv {
+            ev: tx,
+            epoch: 7,
+            current: current.clone(),
+        };
+
+        jev.send(Event::RowCount(1));
+        assert!(matches!(rx.try_recv(), Ok(Event::RowCount(1))));
+
+        // The user disconnected while the job was running.
+        current.store(8, Ordering::SeqCst);
+        assert!(!jev.is_current());
+        jev.send(Event::RowCount(2));
+        assert!(
+            rx.try_recv().is_err(),
+            "a result from the old session is dropped"
+        );
+    }
+
+    #[test]
+    fn nothing_to_cancel_when_no_statement_is_running() {
+        let inflight = Inflight::default();
+        assert_eq!(inflight.running_id(), None);
+
+        let guard = inflight.register(42);
+        assert_eq!(inflight.running_id(), Some(42));
+
+        drop(guard);
+        assert_eq!(inflight.running_id(), None);
+    }
+
+    #[test]
+    fn a_finished_statement_does_not_clear_its_successor() {
+        let inflight = Inflight::default();
+        let first = inflight.register(1);
+        let second = inflight.register(2);
+        assert_eq!(inflight.running_id(), Some(2));
+
+        // The first statement ends late; the slot belongs to the second now.
+        drop(first);
+        assert_eq!(
+            inflight.running_id(),
+            Some(2),
+            "cancel still reaches the live one"
+        );
+
+        drop(second);
+        assert_eq!(inflight.running_id(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_operation_is_given_up_on() {
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        };
+        let e = with_timeout(Duration::from_secs(5), "sample", slow)
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "sample timed out after 5s");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_inside_the_limit_still_returns() {
+        let quick = async { Ok(7) };
+        let v = with_timeout(Duration::from_secs(5), "sample", quick)
+            .await
+            .unwrap();
+        assert_eq!(v, 7);
+    }
 }

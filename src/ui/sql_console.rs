@@ -19,14 +19,29 @@ impl App {
         let blocked = !kind.is_read_only() && !self.allow_writes;
 
         ui.horizontal_wrapped(|ui| {
-            let can_run = self.is_connected() && !self.busy && !blocked;
+            // Other jobs no longer gate this one: only another console
+            // statement does, because there is one cancel slot.
+            let can_run = self.is_connected() && !self.console_running && !blocked;
             if ui
                 .add_enabled(can_run, egui::Button::new("Run  (Ctrl+Enter)"))
                 .clicked()
             {
                 self.run_console_sql();
             }
-            if self.busy {
+            if self.console_running {
+                ui.spinner();
+                if ui
+                    .button("Cancel")
+                    .on_hover_text(
+                        "KILL QUERY on the connection running this statement. The
+                         connection stays open, so the session is not lost.",
+                    )
+                    .clicked()
+                {
+                    self.collector.send(Command::CancelSql);
+                    self.push_log("cancelling statement");
+                }
+            } else if self.busy {
                 ui.spinner();
             }
 
@@ -101,7 +116,7 @@ impl App {
                 .hint_text("SELECT * FROM demo.orders WHERE created_at > NOW() - INTERVAL 1 DAY"),
         );
 
-        if run_shortcut && self.is_connected() && !self.busy && !blocked {
+        if run_shortcut && self.is_connected() && !self.console_running && !blocked {
             self.run_console_sql();
         }
 
